@@ -1,0 +1,23 @@
+{
+  "name": "election-downloader",
+  "version": "1.0.0",
+  "main": "discover_to_knownfiles.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/niusealeo/election-downloader.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/niusealeo/election-downloader/issues"
+  },
+  "homepage": "https://github.com/niusealeo/election-downloader#readme",
+  "description": "",
+  "dependencies": {
+    "newman": "^6.2.2"
+  }
+}

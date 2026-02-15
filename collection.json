@@ -1,6 +1,6 @@
 {
   "info": {
-    "name": "Election Downloader",
+    "name": "Election Acquisition",
     "_postman_id": "00000000-0000-0000-0000-000000000001",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
@@ -10,10 +10,7 @@
       "request": {
         "method": "GET",
         "header": [],
-        "url": {
-          "raw": "{{url_template}}",
-          "host": ["{{url_template}}"]
-        }
+        "url": "{{url_template}}"
       }
     }
   ]

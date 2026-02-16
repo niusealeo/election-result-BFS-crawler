@@ -1,284 +1,152 @@
 /**
- * sink.js
+ * sink.js — One big BFS crawl state, no IDs.
  *
- * Single-crawl folder: BFS_crawl/
- * - Saves BFS level artifacts: BFS_crawl/levels/urls-level-N.json and files-level-N.json
- * - Maintains cross-run state in BFS_crawl/state.json (so multiple Postman runs continue BFS)
- * - Dedupe logic:
- *    * Each level is "replace-on-rerun"
- *    * New levels are filtered against all previous levels + visited inputs (including seeds)
- * - Does NOT write empty urls-level-(N+1).json when no new pages remain
- * - Saves downloaded files into directory structure:
- *    term_##_(GEYEAR)/[NNN_ElectorateName]/<filename>
+ * Folders:
+ *   ./BFS_crawl/
+ *      runs/                 (logs)
+ *      _meta/                (state + artifacts + electorates_by_term.json)
+ *   ./downloads/             (SIBLING of BFS_crawl; actual downloaded files)
  */
 
-const express = require("express");
 const fs = require("fs");
 const path = require("path");
+const express = require("express");
 const { URL } = require("url");
 
-// ---------- config ----------
-const PORT = process.env.PORT || 3000;
+// ----------------------- config / paths -----------------------
+const PORT = Number(process.env.PORT || 3000);
 
-// Change if you want a different root
-const CRAWL_ROOT = path.resolve(process.cwd(), "BFS_crawl");
-const LEVELS_DIR = path.join(CRAWL_ROOT, "levels");
-const DOWNLOADS_DIR = path.join(CRAWL_ROOT, "downloads");
-const STATE_PATH = path.join(CRAWL_ROOT, "state.json");
+const BFS_ROOT = path.resolve(process.cwd(), "BFS_crawl");
 
-// Electorate mapping json produced earlier
-const ELECTORATES_BY_TERM_PATH = path.resolve(process.cwd(), "electorates_by_term.json");
+// downloads are sibling of BFS_crawl (NOT a child)
+const DOWNLOADS_ROOT = path.resolve(process.cwd(), "downloads");
 
-// ---------- helpers ----------
+// logs in BFS_crawl/runs
+const RUNS_DIR = path.join(BFS_ROOT, "runs");
+
+// meta in BFS_crawl/_meta
+const META_DIR = path.join(BFS_ROOT, "_meta");
+const ARTIFACT_DIR = path.join(META_DIR, "artifacts");
+const STATE_PATH = path.join(META_DIR, "state.json");
+const ELECTORATES_BY_TERM_PATH = path.join(META_DIR, "electorates_by_term.json");
+
+// ----------------------- helpers -----------------------
 function ensureDir(p) {
   fs.mkdirSync(p, { recursive: true });
 }
-
-function readJsonIfExists(p, fallback) {
+function readJsonSafe(p, fallback) {
   try {
     if (!fs.existsSync(p)) return fallback;
     return JSON.parse(fs.readFileSync(p, "utf8"));
-  } catch (e) {
+  } catch {
     return fallback;
   }
 }
-
 function writeJson(p, obj) {
   ensureDir(path.dirname(p));
   fs.writeFileSync(p, JSON.stringify(obj, null, 2), "utf8");
 }
-
-function unlinkIfExists(p) {
-  try {
-    if (fs.existsSync(p)) fs.unlinkSync(p);
-  } catch (_) {}
+function appendJsonl(p, obj) {
+  ensureDir(path.dirname(p));
+  fs.appendFileSync(p, JSON.stringify(obj) + "\n", "utf8");
 }
-
-function stableUniq(arr) {
-  const seen = new Set();
-  const out = [];
-  for (const x of arr) {
-    if (!seen.has(x)) {
-      seen.add(x);
-      out.push(x);
-    }
-  }
-  return out;
+function unlinkIfExists(p) {
+  try { if (fs.existsSync(p)) fs.unlinkSync(p); } catch {}
 }
 
 function normalizeUrl(u) {
-  // Trim + remove obvious dot segments normalization via URL
   try {
-    const uu = new URL(u);
-    // Keep query (some election files rely on it), but normalize pathname
-    uu.pathname = uu.pathname.replace(/\/\.\//g, "/").replace(/\/{2,}/g, "/");
-    return uu.toString();
+    const U = new URL(String(u).trim());
+    // remove hash; keep query (some endpoints rely on it)
+    U.hash = "";
+    // normalize /index.html to /
+    if (U.pathname.endsWith("/index.html")) U.pathname = U.pathname.replace(/\/index\.html$/, "/");
+    // collapse // in path
+    U.pathname = U.pathname.replace(/\/{2,}/g, "/");
+    return U.toString();
   } catch {
     return String(u || "").trim();
   }
 }
 
-function isTruthyMetaRow(row) {
-  return row && (row._meta === true || row._meta === "true");
+function extFromUrl(u) {
+  const m = String(u).match(/\.([a-z0-9]+)(?:\?|#|$)/i);
+  return m ? m[1].toLowerCase() : "bin";
 }
 
-function getExtFromUrl(u) {
-  const m = String(u).match(/\.([a-z0-9]+)(?:\?|#|$)/i);
-  return m ? m[1].toLowerCase() : null;
+function safeFilename(name) {
+  // minimal safe: remove path separators + control chars
+  return String(name || "download.bin")
+    .replace(/[\/\\]/g, "_")
+    .replace(/[\u0000-\u001f]/g, "")
+    .slice(0, 240) || "download.bin";
+}
+
+function filenameFromUrl(u) {
+  try {
+    const U = new URL(u);
+    const base = path.basename(U.pathname);
+    return safeFilename(base || "download.bin");
+  } catch {
+    return "download.bin";
+  }
 }
 
 function asciiFold(s) {
-  // remove macrons/diacritics for matching URL slugs
   return String(s || "")
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "")
     .toLowerCase();
 }
 
-function slugToNameGuess(slug) {
-  // "tamaki_makaurau" -> "tamaki makaurau" (folded)
-  return asciiFold(String(slug || "").replace(/[_-]+/g, " ").trim());
-}
-
-function safeFileNameFromUrl(u) {
-  try {
-    const uu = new URL(u);
-    const base = path.basename(uu.pathname);
-    return base || "download.bin";
-  } catch {
-    return "download.bin";
-  }
-}
-
-// ---------- load electorates map ----------
-let electoratesByTerm = {};
-try {
-  electoratesByTerm = JSON.parse(fs.readFileSync(ELECTORATES_BY_TERM_PATH, "utf8"));
-} catch (e) {
-  console.warn("WARNING: electorates_by_term.json not found or invalid at:", ELECTORATES_BY_TERM_PATH);
-  electoratesByTerm = {};
-}
-
-// parse term keys -> { termKey, termNo, geYear }
-function parseTermKey(termKey) {
-  // expects: "term_54_(2023)"
+function termKeyParts(termKey) {
   const m = String(termKey).match(/^term_(\d+)_\((\d{4})\)$/);
   if (!m) return null;
-  return { termKey, termNo: Number(m[1]), geYear: Number(m[2]) };
+  return { termNo: Number(m[1]), geYear: Number(m[2]) };
 }
 
-const termInfos = Object.keys(electoratesByTerm)
-  .map(parseTermKey)
-  .filter(Boolean)
-  .sort((a, b) => a.geYear - b.geYear);
-
-// find termKey for a year that occurs during a parliamentary term:
-// term.geYear <= year < nextTerm.geYear (or last term if no next)
-function termKeyForYear(eventYear) {
-  const y = Number(eventYear);
-  if (!Number.isFinite(y) || termInfos.length === 0) return null;
-
-  for (let i = 0; i < termInfos.length; i++) {
-    const cur = termInfos[i];
-    const next = termInfos[i + 1];
-    if (!next) return cur.termKey;
-    if (y >= cur.geYear && y < next.geYear) return cur.termKey;
+function stableUniq(arr) {
+  const seen = new Set();
+  const out = [];
+  for (const x of arr) {
+    if (!seen.has(x)) { seen.add(x); out.push(x); }
   }
-  return termInfos[termInfos.length - 1]?.termKey || null;
+  return out;
 }
 
-function termKeyForGeYear(geYear) {
-  const y = Number(geYear);
-  const found = termInfos.find(t => t.geYear === y);
-  return found ? found.termKey : null;
-}
+// ----------------------- init folders -----------------------
+ensureDir(BFS_ROOT);
+ensureDir(RUNS_DIR);
+ensureDir(META_DIR);
+ensureDir(ARTIFACT_DIR);
+ensureDir(DOWNLOADS_ROOT);
 
-function electorateFolderFor(termKey, electorateNoOrName) {
-  const t = electoratesByTerm[termKey];
-  if (!t || !t.official_order) return null;
+// logs
+const DEDUPE_LOG = path.join(RUNS_DIR, "dedupe_log.jsonl");
+const FILE_SAVES_LOG = path.join(RUNS_DIR, "file_saves.jsonl");
+const ELECTORATES_INGEST_LOG = path.join(RUNS_DIR, "electorates_ingest.jsonl");
 
-  // If numeric
-  if (typeof electorateNoOrName === "number" || /^\d+$/.test(String(electorateNoOrName))) {
-    const n = Number(electorateNoOrName);
-    const name = t.official_order[String(n)];
-    if (!name) return null;
-    return `${String(n).padStart(3, "0")}_${name}`;
-  }
-
-  // If name
-  const wanted = asciiFold(electorateNoOrName);
-  for (const [numStr, name] of Object.entries(t.official_order)) {
-    if (asciiFold(name) === wanted) {
-      return `${String(Number(numStr)).padStart(3, "0")}_${name}`;
-    }
-  }
-  return null;
-}
-
-function inferPlacementFromUrl(fileUrl) {
-  const u = normalizeUrl(fileUrl);
-
-  // Determine term
-  let termKey = null;
-
-  // A) general election archive style: /electionresults_YYYY/
-  {
-    const m = u.match(/\/electionresults_(\d{4})\//i);
-    if (m) {
-      termKey = termKeyForGeYear(Number(m[1]));
-    }
-  }
-
-  // B) event style: /YYYY_*_byelection/ or /YYYY_*referendum/
-  if (!termKey) {
-    const m = u.match(/\/(\d{4})_[^/]*(byelection|by-election|referendum)/i);
-    if (m) {
-      termKey = termKeyForYear(Number(m[1]));
-    }
-  }
-
-  // C) fallback: any year in path
-  if (!termKey) {
-    const m = u.match(/\/(\d{4})(?:[^0-9]|$)/);
-    if (m) {
-      termKey = termKeyForYear(Number(m[1]));
-    }
-  }
-
-  // Determine electorate (optional)
-  let electorateFolder = null;
-
-  // 1) /eNN/ pattern like /e9/ (GE electorate index)
-  if (termKey && !electorateFolder) {
-    const m = u.match(/\/e(\d{1,3})\//i);
-    if (m) electorateFolder = electorateFolderFor(termKey, Number(m[1]));
-  }
-
-  // 2) by-election slug: /2025_tamaki_makaurau_byelection/
-  if (termKey && !electorateFolder) {
-    const m = u.match(/\/\d{4}_([^/]+?)_(?:byelection|by-election)\//i);
-    if (m) {
-      const guess = slugToNameGuess(m[1]); // folded
-      // match against official_order names
-      const t = electoratesByTerm[termKey];
-      if (t?.official_order) {
-        for (const [numStr, name] of Object.entries(t.official_order)) {
-          if (asciiFold(name) === guess) {
-            electorateFolder = `${String(Number(numStr)).padStart(3, "0")}_${name}`;
-            break;
-          }
-        }
-      }
-    }
-  }
-
-  // 3) try to match any electorate name appearing in URL (best-effort)
-  if (termKey && !electorateFolder) {
-    const t = electoratesByTerm[termKey];
-    if (t?.official_order) {
-      const foldedUrl = asciiFold(u.replace(/[^a-z0-9]+/g, " "));
-      for (const [numStr, name] of Object.entries(t.official_order)) {
-        const foldedName = asciiFold(name);
-        // require whole-word-ish match to reduce false positives
-        if (foldedUrl.includes(` ${foldedName} `) || foldedUrl.startsWith(`${foldedName} `) || foldedUrl.endsWith(` ${foldedName}`)) {
-          electorateFolder = `${String(Number(numStr)).padStart(3, "0")}_${name}`;
-          break;
-        }
-      }
-    }
-  }
-
-  // If still no termKey, use "term_unknown"
-  if (!termKey) termKey = "term_unknown";
-
-  return { termKey, electorateFolder };
-}
-
-// ---------- BFS state ----------
+// ----------------------- BFS state model -----------------------
+/**
+ * state.json:
+ * {
+ *   levels: {
+ *     "1": { visited: [url...], pages: [url...], files: [{url, ext}...] },
+ *     "2": ...
+ *   }
+ * }
+ */
 function defaultState() {
-  return {
-    // levels[level] = { visited: [url], pages: [url], files: [{url, ext}] }
-    levels: {}
-  };
+  return { levels: {} };
 }
-
 function loadState() {
-  return readJsonIfExists(STATE_PATH, defaultState());
+  return readJsonSafe(STATE_PATH, defaultState());
 }
-
 function saveState(st) {
   writeJson(STATE_PATH, st);
 }
 
-function levelPathUrls(level) {
-  return path.join(LEVELS_DIR, `urls-level-${level}.json`);
-}
-
-function levelPathFiles(level) {
-  return path.join(LEVELS_DIR, `files-level-${level}.json`);
-}
-
-function computeSeenFromState(st, upToLevelInclusive) {
+function computeSeenUpTo(st, maxLevelInclusive) {
   const seenPages = new Set();
   const seenFiles = new Set();
 
@@ -288,49 +156,117 @@ function computeSeenFromState(st, upToLevelInclusive) {
     .sort((a, b) => a - b);
 
   for (const L of levels) {
-    if (L > upToLevelInclusive) break;
+    if (L > maxLevelInclusive) break;
     const rec = st.levels[String(L)];
     if (!rec) continue;
-
-    for (const u of rec.visited || []) seenPages.add(normalizeUrl(u));
-    for (const u of rec.pages || []) seenPages.add(normalizeUrl(u));
-
-    for (const f of rec.files || []) {
-      if (f?.url) seenFiles.add(normalizeUrl(f.url));
-    }
+    for (const u of (rec.visited || [])) seenPages.add(normalizeUrl(u));
+    for (const u of (rec.pages || [])) seenPages.add(normalizeUrl(u));
+    for (const f of (rec.files || [])) if (f?.url) seenFiles.add(normalizeUrl(f.url));
   }
-
   return { seenPages, seenFiles };
 }
 
-// ---------- app ----------
+// ----------------------- electorates map + routing -----------------------
+function loadElectoratesByTerm() {
+  return readJsonSafe(ELECTORATES_BY_TERM_PATH, {});
+}
+
+function termKeyForUrl(u, electoratesByTerm) {
+  const url = String(u);
+
+  // GE archive URL
+  let m = url.match(/\/electionresults_(\d{4})\//i);
+  if (m) {
+    const geYear = Number(m[1]);
+    // find exact term key by GE year
+    for (const k of Object.keys(electoratesByTerm)) {
+      const p = termKeyParts(k);
+      if (p && p.geYear === geYear) return k;
+    }
+  }
+
+  // by-election / referendum style includes event year
+  m = url.match(/\/(\d{4})_[^/]*(byelection|by-election|referendum)\//i);
+  let eventYear = m ? Number(m[1]) : null;
+  if (!eventYear) {
+    // fallback: first year in path
+    m = url.match(/(19\d{2}|20\d{2})/);
+    if (m) eventYear = Number(m[1]);
+  }
+  if (!eventYear) return "term_unknown";
+
+  // choose term where term.geYear <= eventYear < nextTerm.geYear
+  const terms = Object.keys(electoratesByTerm)
+    .map(k => ({ k, p: termKeyParts(k) }))
+    .filter(x => x.p)
+    .sort((a, b) => a.p.geYear - b.p.geYear);
+
+  for (let i = 0; i < terms.length; i++) {
+    const cur = terms[i];
+    const next = terms[i + 1];
+    if (!next) return cur.k;
+    if (eventYear >= cur.p.geYear && eventYear < next.p.geYear) return cur.k;
+  }
+  return terms[terms.length - 1]?.k || "term_unknown";
+}
+
+function electorateFolderFor(termKey, url, electoratesByTerm) {
+  const t = electoratesByTerm[termKey];
+  if (!t?.official_order) return null;
+
+  const u = String(url);
+
+  // Pattern /eNN/
+  let m = u.match(/\/e(\d{1,3})\//i);
+  if (m) {
+    const n = Number(m[1]);
+    const name = t.official_order[String(n)];
+    if (name) return `${String(n).padStart(3, "0")}_${name}`;
+  }
+
+  // Pattern /YYYY_slug_byelection/
+  m = u.match(/\/\d{4}_([^/]+?)_(?:byelection|by-election)\//i);
+  if (m) {
+    const guess = asciiFold(m[1].replace(/[_-]+/g, " "));
+    for (const [numStr, name] of Object.entries(t.official_order)) {
+      if (asciiFold(name) === guess) {
+        return `${String(Number(numStr)).padStart(3, "0")}_${name}`;
+      }
+    }
+  }
+
+  // Fallback: match electorate name tokens in URL (folded)
+  const foldedUrl = asciiFold(u.replace(/[^a-z0-9]+/g, " "));
+  for (const [numStr, name] of Object.entries(t.official_order)) {
+    const foldedName = asciiFold(name);
+    if (
+      foldedUrl.includes(` ${foldedName} `) ||
+      foldedUrl.startsWith(`${foldedName} `) ||
+      foldedUrl.endsWith(` ${foldedName}`)
+    ) {
+      return `${String(Number(numStr)).padStart(3, "0")}_${name}`;
+    }
+  }
+
+  return null;
+}
+
+// ----------------------- app -----------------------
 const app = express();
-app.use(express.json({ limit: "50mb" })); // large enough for base64 file payloads
+app.use(express.json({ limit: "750mb" }));
 
-ensureDir(CRAWL_ROOT);
-ensureDir(LEVELS_DIR);
-ensureDir(DOWNLOADS_DIR);
-
-// Health
-app.get("/", (_req, res) => {
-  res.json({ ok: true, root: CRAWL_ROOT });
+app.get("/health", (_req, res) => {
+  res.json({
+    ok: true,
+    BFS_ROOT,
+    DOWNLOADS_ROOT,
+    META_DIR,
+    RUNS_DIR
+  });
 });
 
-/**
- * POST /dedupe/level
- * body: {
- *   level: number,
- *   visited?: [{url}|string] or [string],
- *   pages?: [{url}|string] or [string],
- *   files?: [{url, ext}]  (optional; if omitted or empty => no files output)
- * }
- *
- * Semantics:
- *  - Replaces stored content for this level (rerun-safe)
- *  - Produces:
- *      urls-level-(level+1).json  ONLY if there are new unique pages remaining
- *      files-level-(level).json   ONLY if there are any files
- */
+// ---------- 1) DEDUPE LEVEL ----------
+// DOES NOT WRITE EMPTY urls-level-(L+1).json
 app.post("/dedupe/level", (req, res) => {
   try {
     const level = Number(req.body?.level);
@@ -338,132 +274,185 @@ app.post("/dedupe/level", (req, res) => {
       return res.status(400).json({ ok: false, error: "Invalid level" });
     }
 
-    // Normalize inputs
-    const inVisitedRaw = req.body?.visited || [];
-    const inPagesRaw = req.body?.pages || [];
-    const inFilesRaw = req.body?.files || [];
+    const toUrlArray = (raw) =>
+      stableUniq(
+        (Array.isArray(raw) ? raw : [])
+          .map(r => (typeof r === "string" ? r : r?.url))
+          .filter(Boolean)
+          .map(normalizeUrl)
+      );
 
-    const toUrlList = (raw) =>
-      (Array.isArray(raw) ? raw : [])
-        .filter(r => !isTruthyMetaRow(r))
-        .map(r => (typeof r === "string" ? r : r?.url))
-        .filter(Boolean)
-        .map(normalizeUrl);
+    const visited = toUrlArray(req.body?.visited || []);
+    const pages = toUrlArray(req.body?.pages || []);
 
-    const visited = stableUniq(toUrlList(inVisitedRaw));
-    const pages = stableUniq(toUrlList(inPagesRaw));
-
+    const inFiles = Array.isArray(req.body?.files) ? req.body.files : [];
     const files = stableUniq(
-      (Array.isArray(inFilesRaw) ? inFilesRaw : [])
-        .filter(r => r && !isTruthyMetaRow(r) && r.url)
-        .map(r => ({
-          url: normalizeUrl(r.url),
-          ext: (r.ext || getExtFromUrl(r.url) || "bin").toLowerCase()
+      inFiles
+        .filter(f => f?.url)
+        .map(f => ({
+          url: normalizeUrl(f.url),
+          ext: (f.ext || extFromUrl(f.url) || "bin").toLowerCase()
         }))
-    );
+        .map(f => JSON.stringify(f))
+    ).map(s => JSON.parse(s));
 
-    // Load state and REPLACE this level record
+    // Load + replace level record (rerun-safe)
     const st = loadState();
     st.levels[String(level)] = { visited, pages, files };
     saveState(st);
 
-    // Compute seen up to this level (includes visited + pages + files of <= level)
-    const { seenPages, seenFiles } = computeSeenFromState(st, level);
+    // Build seen sets for filtering:
+    // - Next level must exclude anything seen in levels < level
+    // - Also exclude current level's visited seeds (so seed won't reappear)
+    const { seenPages: seenPagesBefore, seenFiles: seenFilesBefore } = computeSeenUpTo(st, level - 1);
+    const seenForNextPages = new Set([...seenPagesBefore, ...visited]);
+    const nextPages = pages.filter(u => !seenForNextPages.has(u));
 
-    // Next level pages should be: current 'pages' filtered by all pages already seen in <= level
-    // BUT: because pages are discovered *from* level input, they belong to (level+1).
-    // So we filter against seen up to level (which includes visited seeds etc).
-    const nextPages = pages.filter(u => !seenPages.has(u)); // NOTE: seenPages includes pages itself now
-    // Wait—pages is already in seenPages because we stored it. We need to filter against levels < level+1
-    // Correct approach: seen up to (level-1) PLUS visited of current level (to kill seed repeats),
-    // but not including current pages themselves.
-    const { seenPages: seenPagesBefore } = computeSeenFromState(st, level - 1);
-    const seenForNext = new Set([...seenPagesBefore, ...visited.map(normalizeUrl)]);
+    const filesOut = files.filter(f => !seenFilesBefore.has(f.url));
 
-    const nextPagesFiltered = pages.filter(u => !seenForNext.has(u));
-
-    // Files at this level: similarly filter against files seen in previous levels (but allow overwrite on rerun)
-    const { seenFiles: seenFilesBefore } = computeSeenFromState(st, level - 1);
-    const filesFiltered = files.filter(f => !seenFilesBefore.has(f.url));
-
-    // Write urls-level-(level+1).json ONLY if any next pages exist
+    // Write artifacts into BFS_crawl/_meta/artifacts
     const nextLevel = level + 1;
-    const nextUrlsPath = levelPathUrls(nextLevel);
-    const urlsPayload = nextPagesFiltered.map(url => ({ url, level: nextLevel, kind: "urls" })); // meta conflated per-row style
+    const nextUrlsPath = path.join(ARTIFACT_DIR, `urls-level-${nextLevel}.json`);
+    const filesPath = path.join(ARTIFACT_DIR, `files-level-${level}.json`);
 
-    if (urlsPayload.length > 0) {
-      writeJson(nextUrlsPath, urlsPayload);
+    if (nextPages.length > 0) {
+      // per-row carries level/kind; no separate meta row
+      writeJson(nextUrlsPath, nextPages.map(url => ({ url, level: nextLevel, kind: "urls" })));
     } else {
-      // do not produce empty file; delete if exists
+      // IMPORTANT: do not produce an empty file
       unlinkIfExists(nextUrlsPath);
     }
 
-    // Write files-level-(level).json ONLY if any files exist
-    const filesPath = levelPathFiles(level);
-    const filesPayload = filesFiltered.map(f => ({ url: f.url, ext: f.ext, level, kind: "files" }));
-
-    if (filesPayload.length > 0) {
-      writeJson(filesPath, filesPayload);
+    if (filesOut.length > 0) {
+      writeJson(filesPath, filesOut.map(f => ({ url: f.url, ext: f.ext, level, kind: "files" })));
     } else {
       unlinkIfExists(filesPath);
     }
 
-    return res.json({
+    appendJsonl(DEDUPE_LOG, {
+      ts: new Date().toISOString(),
+      level,
+      visited: visited.length,
+      pages_in: pages.length,
+      pages_out_next: nextPages.length,
+      files_in: files.length,
+      files_out: filesOut.length
+    });
+
+    res.json({
       ok: true,
       level,
-      wrote_next_urls: urlsPayload.length,
-      wrote_files: filesPayload.length,
-      next_urls_path: urlsPayload.length ? nextUrlsPath : null,
-      files_path: filesPayload.length ? filesPath : null
+      next_level: nextLevel,
+      wrote_next_urls: nextPages.length,
+      wrote_files: filesOut.length,
+      next_urls_path: nextPages.length ? nextUrlsPath : null,
+      files_path: filesOut.length ? filesPath : null
     });
   } catch (e) {
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
 
-/**
- * POST /upload/file
- * body: { url, ext?, content_base64 }
- *
- * Saves into:
- *   BFS_crawl/downloads/<termKey>/<NNN_ElectorateName?>/<filename>
- *
- * Overwrites if exists (as you requested).
- */
+// ---------- 2) UPLOAD FILE (save into term/electorate structure) ----------
 app.post("/upload/file", (req, res) => {
   try {
     const url = normalizeUrl(req.body?.url);
-    const ext = (req.body?.ext || getExtFromUrl(url) || "bin").toLowerCase();
+    const ext = (req.body?.ext || extFromUrl(url) || "bin").toLowerCase();
     const b64 = req.body?.content_base64;
 
-    if (!url || !b64) {
-      return res.status(400).json({ ok: false, error: "Missing url or content_base64" });
-    }
+    if (!url || !b64) return res.status(400).json({ ok: false, error: "Missing url or content_base64" });
 
-    const { termKey, electorateFolder } = inferPlacementFromUrl(url);
+    const electoratesByTerm = loadElectoratesByTerm();
+    const termKey = termKeyForUrl(url, electoratesByTerm);
+    const electorateFolder = electorateFolderFor(termKey, url, electoratesByTerm);
 
-    const termDir = path.join(DOWNLOADS_DIR, termKey);
+    const termDir = path.join(DOWNLOADS_ROOT, termKey);
     const finalDir = electorateFolder ? path.join(termDir, electorateFolder) : termDir;
-
     ensureDir(finalDir);
 
-    let filename = safeFileNameFromUrl(url);
-    // If filename has no extension but ext provided, add it
+    let filename = filenameFromUrl(url);
     if (!/\.[a-z0-9]+$/i.test(filename) && ext) filename += `.${ext}`;
+    filename = safeFilename(filename);
 
     const outPath = path.join(finalDir, filename);
-    const buf = Buffer.from(b64, "base64");
-
+    const buf = Buffer.from(String(b64), "base64");
     fs.writeFileSync(outPath, buf); // overwrite
-    return res.json({ ok: true, saved_to: outPath, bytes: buf.length });
+
+    appendJsonl(FILE_SAVES_LOG, {
+      ts: new Date().toISOString(),
+      url,
+      termKey,
+      electorateFolder: electorateFolder || null,
+      saved_to: outPath,
+      bytes: buf.length
+    });
+
+    res.json({ ok: true, saved_to: outPath, bytes: buf.length });
   } catch (e) {
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+// ---------- 3) ELECTORATES INGEST (build electorates_by_term.json from Postman) ----------
+/**
+ * POST /meta/electorates/upsert
+ * Body:
+ * {
+ *   term_key: "term_54_(2023)",
+ *   ge_year: 2023,              // optional, informational
+ *   official_order: { "1": "Te Tai Tokerau", ... },     // REQUIRED
+ *   alpha_index: { "Auckland Central": 1, ... }         // REQUIRED
+ * }
+ *
+ * This writes/updates BFS_crawl/_meta/electorates_by_term.json
+ */
+app.post("/meta/electorates/upsert", (req, res) => {
+  try {
+    const termKey = String(req.body?.term_key || "").trim();
+    if (!termKey) return res.status(400).json({ ok: false, error: "Missing term_key" });
+
+    const official_order = req.body?.official_order;
+    const alpha_index = req.body?.alpha_index;
+
+    if (!official_order || typeof official_order !== "object") {
+      return res.status(400).json({ ok: false, error: "Missing official_order object" });
+    }
+    if (!alpha_index || typeof alpha_index !== "object") {
+      return res.status(400).json({ ok: false, error: "Missing alpha_index object" });
+    }
+
+    // basic sanity: official_order keys should be numeric strings
+    const nums = Object.keys(official_order).filter(k => /^\d+$/.test(k)).map(k => Number(k));
+    if (nums.length === 0) {
+      return res.status(400).json({ ok: false, error: "official_order must have numeric string keys" });
+    }
+
+    const db = loadElectoratesByTerm();
+    db[termKey] = {
+      term_key: termKey,
+      ge_year: req.body?.ge_year ?? null,
+      official_order,
+      alpha_index
+    };
+    writeJson(ELECTORATES_BY_TERM_PATH, db);
+
+    appendJsonl(ELECTORATES_INGEST_LOG, {
+      ts: new Date().toISOString(),
+      term_key: termKey,
+      count: Object.keys(official_order).length
+    });
+
+    res.json({ ok: true, saved: ELECTORATES_BY_TERM_PATH, term_key: termKey });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
 
 app.listen(PORT, () => {
-  console.log(`sink.js listening on http://localhost:${PORT}`);
-  console.log(`CRAWL_ROOT: ${CRAWL_ROOT}`);
-  console.log(`LEVELS_DIR: ${LEVELS_DIR}`);
-  console.log(`DOWNLOADS_DIR: ${DOWNLOADS_DIR}`);
+  console.log(`sink listening on http://localhost:${PORT}`);
+  console.log(`BFS_ROOT: ${BFS_ROOT}`);
+  console.log(`DOWNLOADS_ROOT (sibling): ${DOWNLOADS_ROOT}`);
+  console.log(`META_DIR: ${META_DIR}`);
+  console.log(`RUNS_DIR: ${RUNS_DIR}`);
+  console.log(`electorates_by_term.json: ${ELECTORATES_BY_TERM_PATH}`);
 });

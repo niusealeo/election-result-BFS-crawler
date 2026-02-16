@@ -1,311 +1,469 @@
 /**
- * sink.js — single BFS crawl + file sink
+ * sink.js
  *
- * Usage:
- *   npm i express multer sanitize-filename
- *   node sink.js
- *
- * Writes to:
- *   ./downloads/
- *     term_.../ ... (downloaded files saved via /sink/raw)
- *   ./downloads/_meta/runs/BFS_crawl/
- *     seen_pages.json, seen_files.json
- *     level_pages_N.json, level_files_N.json
- *     dedupe_log.jsonl
- *   ./downloads/_meta/artifacts/
- *     urls-level-N.json, files-level-N.json
+ * Single-crawl folder: BFS_crawl/
+ * - Saves BFS level artifacts: BFS_crawl/levels/urls-level-N.json and files-level-N.json
+ * - Maintains cross-run state in BFS_crawl/state.json (so multiple Postman runs continue BFS)
+ * - Dedupe logic:
+ *    * Each level is "replace-on-rerun"
+ *    * New levels are filtered against all previous levels + visited inputs (including seeds)
+ * - Does NOT write empty urls-level-(N+1).json when no new pages remain
+ * - Saves downloaded files into directory structure:
+ *    term_##_(GEYEAR)/[NNN_ElectorateName]/<filename>
  */
 
+const express = require("express");
 const fs = require("fs");
 const path = require("path");
-const express = require("express");
-const sanitize = require("sanitize-filename");
+const { URL } = require("url");
 
-const app = express();
-app.use(express.json({ limit: "750mb" })); // allow big base64 payloads
+// ---------- config ----------
+const PORT = process.env.PORT || 3000;
 
-// ---------- paths ----------
-const DOWNLOADS_ROOT = path.resolve(process.env.DOWNLOADS_ROOT || "./downloads");
-const META_DIR = path.join(DOWNLOADS_ROOT, "_meta");
-const ARTIFACT_DIR = path.join(META_DIR, "artifacts");
-const RUNS_DIR = path.join(META_DIR, "runs");
+// Change if you want a different root
+const CRAWL_ROOT = path.resolve(process.cwd(), "BFS_crawl");
+const LEVELS_DIR = path.join(CRAWL_ROOT, "levels");
+const DOWNLOADS_DIR = path.join(CRAWL_ROOT, "downloads");
+const STATE_PATH = path.join(CRAWL_ROOT, "state.json");
 
-// one shared crawl folder
-const BFS_RUN_TAG = "BFS_crawl";
-const BFS_RUN_DIR = path.join(RUNS_DIR, BFS_RUN_TAG);
+// Electorate mapping json produced earlier
+const ELECTORATES_BY_TERM_PATH = path.resolve(process.cwd(), "electorates_by_term.json");
 
+// ---------- helpers ----------
 function ensureDir(p) {
   fs.mkdirSync(p, { recursive: true });
 }
-ensureDir(DOWNLOADS_ROOT);
-ensureDir(META_DIR);
-ensureDir(ARTIFACT_DIR);
-ensureDir(RUNS_DIR);
-ensureDir(BFS_RUN_DIR);
 
-function readJsonSafe(p, fallback) {
-  try { return JSON.parse(fs.readFileSync(p, "utf8")); }
-  catch { return fallback; }
+function readJsonIfExists(p, fallback) {
+  try {
+    if (!fs.existsSync(p)) return fallback;
+    return JSON.parse(fs.readFileSync(p, "utf8"));
+  } catch (e) {
+    return fallback;
+  }
 }
+
 function writeJson(p, obj) {
   ensureDir(path.dirname(p));
   fs.writeFileSync(p, JSON.stringify(obj, null, 2), "utf8");
 }
-function appendJsonl(p, obj) {
-  ensureDir(path.dirname(p));
-  fs.appendFileSync(p, JSON.stringify(obj) + "\n", "utf8");
+
+function unlinkIfExists(p) {
+  try {
+    if (fs.existsSync(p)) fs.unlinkSync(p);
+  } catch (_) {}
 }
 
-function safePart(s) {
-  return sanitize(String(s || "")).replace(/\s+/g, "_");
+function stableUniq(arr) {
+  const seen = new Set();
+  const out = [];
+  for (const x of arr) {
+    if (!seen.has(x)) {
+      seen.add(x);
+      out.push(x);
+    }
+  }
+  return out;
 }
 
-// ---------- electorate/term routing (minimal; extend if needed) ----------
-const TERM_BY_GE_YEAR = {
-  1996: 45, 1999: 46, 2002: 47, 2005: 48, 2008: 49,
-  2011: 50, 2014: 51, 2017: 52, 2020: 53, 2023: 54,
-};
-
-function termKeyFromGeYear(geYear) {
-  const term = TERM_BY_GE_YEAR[geYear];
-  if (!term) return null;
-  return `term_${term}_(${geYear})`;
+function normalizeUrl(u) {
+  // Trim + remove obvious dot segments normalization via URL
+  try {
+    const uu = new URL(u);
+    // Keep query (some election files rely on it), but normalize pathname
+    uu.pathname = uu.pathname.replace(/\/\.\//g, "/").replace(/\/{2,}/g, "/");
+    return uu.toString();
+  } catch {
+    return String(u || "").trim();
+  }
 }
 
-function geYearFromUrl(u) {
-  const m = String(u).match(/electionresults_(\d{4})/i);
-  return m ? Number(m[1]) : null;
+function isTruthyMetaRow(row) {
+  return row && (row._meta === true || row._meta === "true");
 }
 
-function anyYearFromUrl(u) {
-  const m = String(u).match(/(19\d{2}|20\d{2})/);
-  return m ? Number(m[1]) : null;
+function getExtFromUrl(u) {
+  const m = String(u).match(/\.([a-z0-9]+)(?:\?|#|$)/i);
+  return m ? m[1].toLowerCase() : null;
 }
 
-function termKeyForUrl(u) {
-  const ge = geYearFromUrl(u);
-  if (ge && TERM_BY_GE_YEAR[ge]) return termKeyFromGeYear(ge);
+function asciiFold(s) {
+  // remove macrons/diacritics for matching URL slugs
+  return String(s || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
+}
 
-  const y = anyYearFromUrl(u);
-  if (y != null) {
-    // coarse fallback bands
-    if (y >= 2023) return "term_54_(2023)";
-    if (y >= 2020) return "term_53_(2020)";
-    if (y >= 2017) return "term_52_(2017)";
-    if (y >= 2014) return "term_51_(2014)";
-    if (y >= 2011) return "term_50_(2011)";
-    if (y >= 2008) return "term_49_(2008)";
-    if (y >= 2005) return "term_48_(2005)";
-    if (y >= 2002) return "term_47_(2002)";
-    if (y >= 1999) return "term_46_(1999)";
-    if (y >= 1996) return "term_45_(1996)";
+function slugToNameGuess(slug) {
+  // "tamaki_makaurau" -> "tamaki makaurau" (folded)
+  return asciiFold(String(slug || "").replace(/[_-]+/g, " ").trim());
+}
+
+function safeFileNameFromUrl(u) {
+  try {
+    const uu = new URL(u);
+    const base = path.basename(uu.pathname);
+    return base || "download.bin";
+  } catch {
+    return "download.bin";
+  }
+}
+
+// ---------- load electorates map ----------
+let electoratesByTerm = {};
+try {
+  electoratesByTerm = JSON.parse(fs.readFileSync(ELECTORATES_BY_TERM_PATH, "utf8"));
+} catch (e) {
+  console.warn("WARNING: electorates_by_term.json not found or invalid at:", ELECTORATES_BY_TERM_PATH);
+  electoratesByTerm = {};
+}
+
+// parse term keys -> { termKey, termNo, geYear }
+function parseTermKey(termKey) {
+  // expects: "term_54_(2023)"
+  const m = String(termKey).match(/^term_(\d+)_\((\d{4})\)$/);
+  if (!m) return null;
+  return { termKey, termNo: Number(m[1]), geYear: Number(m[2]) };
+}
+
+const termInfos = Object.keys(electoratesByTerm)
+  .map(parseTermKey)
+  .filter(Boolean)
+  .sort((a, b) => a.geYear - b.geYear);
+
+// find termKey for a year that occurs during a parliamentary term:
+// term.geYear <= year < nextTerm.geYear (or last term if no next)
+function termKeyForYear(eventYear) {
+  const y = Number(eventYear);
+  if (!Number.isFinite(y) || termInfos.length === 0) return null;
+
+  for (let i = 0; i < termInfos.length; i++) {
+    const cur = termInfos[i];
+    const next = termInfos[i + 1];
+    if (!next) return cur.termKey;
+    if (y >= cur.geYear && y < next.geYear) return cur.termKey;
+  }
+  return termInfos[termInfos.length - 1]?.termKey || null;
+}
+
+function termKeyForGeYear(geYear) {
+  const y = Number(geYear);
+  const found = termInfos.find(t => t.geYear === y);
+  return found ? found.termKey : null;
+}
+
+function electorateFolderFor(termKey, electorateNoOrName) {
+  const t = electoratesByTerm[termKey];
+  if (!t || !t.official_order) return null;
+
+  // If numeric
+  if (typeof electorateNoOrName === "number" || /^\d+$/.test(String(electorateNoOrName))) {
+    const n = Number(electorateNoOrName);
+    const name = t.official_order[String(n)];
+    if (!name) return null;
+    return `${String(n).padStart(3, "0")}_${name}`;
+  }
+
+  // If name
+  const wanted = asciiFold(electorateNoOrName);
+  for (const [numStr, name] of Object.entries(t.official_order)) {
+    if (asciiFold(name) === wanted) {
+      return `${String(Number(numStr)).padStart(3, "0")}_${name}`;
+    }
   }
   return null;
 }
 
-// ---------- health ----------
-app.get("/health", (_req, res) => res.json({ ok: true }));
+function inferPlacementFromUrl(fileUrl) {
+  const u = normalizeUrl(fileUrl);
 
-// ---------- BFS state paths ----------
-function bfsPaths() {
+  // Determine term
+  let termKey = null;
+
+  // A) general election archive style: /electionresults_YYYY/
+  {
+    const m = u.match(/\/electionresults_(\d{4})\//i);
+    if (m) {
+      termKey = termKeyForGeYear(Number(m[1]));
+    }
+  }
+
+  // B) event style: /YYYY_*_byelection/ or /YYYY_*referendum/
+  if (!termKey) {
+    const m = u.match(/\/(\d{4})_[^/]*(byelection|by-election|referendum)/i);
+    if (m) {
+      termKey = termKeyForYear(Number(m[1]));
+    }
+  }
+
+  // C) fallback: any year in path
+  if (!termKey) {
+    const m = u.match(/\/(\d{4})(?:[^0-9]|$)/);
+    if (m) {
+      termKey = termKeyForYear(Number(m[1]));
+    }
+  }
+
+  // Determine electorate (optional)
+  let electorateFolder = null;
+
+  // 1) /eNN/ pattern like /e9/ (GE electorate index)
+  if (termKey && !electorateFolder) {
+    const m = u.match(/\/e(\d{1,3})\//i);
+    if (m) electorateFolder = electorateFolderFor(termKey, Number(m[1]));
+  }
+
+  // 2) by-election slug: /2025_tamaki_makaurau_byelection/
+  if (termKey && !electorateFolder) {
+    const m = u.match(/\/\d{4}_([^/]+?)_(?:byelection|by-election)\//i);
+    if (m) {
+      const guess = slugToNameGuess(m[1]); // folded
+      // match against official_order names
+      const t = electoratesByTerm[termKey];
+      if (t?.official_order) {
+        for (const [numStr, name] of Object.entries(t.official_order)) {
+          if (asciiFold(name) === guess) {
+            electorateFolder = `${String(Number(numStr)).padStart(3, "0")}_${name}`;
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  // 3) try to match any electorate name appearing in URL (best-effort)
+  if (termKey && !electorateFolder) {
+    const t = electoratesByTerm[termKey];
+    if (t?.official_order) {
+      const foldedUrl = asciiFold(u.replace(/[^a-z0-9]+/g, " "));
+      for (const [numStr, name] of Object.entries(t.official_order)) {
+        const foldedName = asciiFold(name);
+        // require whole-word-ish match to reduce false positives
+        if (foldedUrl.includes(` ${foldedName} `) || foldedUrl.startsWith(`${foldedName} `) || foldedUrl.endsWith(` ${foldedName}`)) {
+          electorateFolder = `${String(Number(numStr)).padStart(3, "0")}_${name}`;
+          break;
+        }
+      }
+    }
+  }
+
+  // If still no termKey, use "term_unknown"
+  if (!termKey) termKey = "term_unknown";
+
+  return { termKey, electorateFolder };
+}
+
+// ---------- BFS state ----------
+function defaultState() {
   return {
-    runTag: BFS_RUN_TAG,
-    runDir: BFS_RUN_DIR,
-    seenPagesPath: path.join(BFS_RUN_DIR, "seen_pages.json"),
-    seenFilesPath: path.join(BFS_RUN_DIR, "seen_files.json"),
+    // levels[level] = { visited: [url], pages: [url], files: [{url, ext}] }
+    levels: {}
   };
 }
 
-function listStoredLevels(runDir) {
-  const levels = new Set();
-  for (const f of fs.readdirSync(runDir)) {
-    const m = f.match(/^level_pages_(\d+)\.json$/);
-    if (m) levels.add(Number(m[1]));
-  }
-  return Array.from(levels).sort((a, b) => a - b);
+function loadState() {
+  return readJsonIfExists(STATE_PATH, defaultState());
 }
 
-// ---------- DEDUPE: Policy A (rerun level L clears levels >= L) ----------
-app.post("/dedupe/level", (req, res) => {
-  const { level, pages, files } = req.body || {};
+function saveState(st) {
+  writeJson(STATE_PATH, st);
+}
 
-  const L = Number(level);
-  if (!Number.isFinite(L) || L < 1) {
-    return res.status(400).json({ ok: false, error: "Invalid level" });
-  }
-  if (!Array.isArray(pages)) {
-    return res.status(400).json({ ok: false, error: "pages must be an array of {url}" });
-  }
+function levelPathUrls(level) {
+  return path.join(LEVELS_DIR, `urls-level-${level}.json`);
+}
 
-  const { runDir, seenPagesPath, seenFilesPath, runTag } = bfsPaths();
+function levelPathFiles(level) {
+  return path.join(LEVELS_DIR, `files-level-${level}.json`);
+}
 
-  const seenPages = new Set(readJsonSafe(seenPagesPath, []));
-  const seenFiles = new Set(readJsonSafe(seenFilesPath, []));
+function computeSeenFromState(st, upToLevelInclusive) {
+  const seenPages = new Set();
+  const seenFiles = new Set();
 
-  // POLICY A: clear contributions for all levels >= L
-  const storedLevels = listStoredLevels(runDir);
-  const toClear = storedLevels.filter(x => x >= L);
+  const levels = Object.keys(st.levels)
+    .map(k => Number(k))
+    .filter(n => Number.isFinite(n))
+    .sort((a, b) => a - b);
 
-  for (const lvl of toClear) {
-    const lp = path.join(runDir, `level_pages_${lvl}.json`);
-    const lf = path.join(runDir, `level_files_${lvl}.json`);
+  for (const L of levels) {
+    if (L > upToLevelInclusive) break;
+    const rec = st.levels[String(L)];
+    if (!rec) continue;
 
-    const oldPages = readJsonSafe(lp, []);
-    const oldFiles = readJsonSafe(lf, []);
+    for (const u of rec.visited || []) seenPages.add(normalizeUrl(u));
+    for (const u of rec.pages || []) seenPages.add(normalizeUrl(u));
 
-    for (const u of oldPages) seenPages.delete(u);
-    for (const u of oldFiles) seenFiles.delete(u);
-
-    if (fs.existsSync(lp)) fs.unlinkSync(lp);
-    if (fs.existsSync(lf)) fs.unlinkSync(lf);
-  }
-
-  // Filter incoming against memory of levels < L
-  const newPages = [];
-  for (const row of pages) {
-    const u = row?.url;
-    if (!u) continue;
-    if (seenPages.has(u)) continue;
-    seenPages.add(u);
-    newPages.push(u);
-  }
-
-  const inFiles = Array.isArray(files) ? files : [];
-  const newFiles = [];
-  for (const row of inFiles) {
-    const u = row?.url;
-    if (!u) continue;
-    if (seenFiles.has(u)) continue;
-    seenFiles.add(u);
-    newFiles.push({ url: u, ext: row?.ext || "unknown" });
-  }
-
-  // persist level contribution
-  writeJson(path.join(runDir, `level_pages_${L}.json`), newPages);
-  writeJson(path.join(runDir, `level_files_${L}.json`), newFiles.map(f => f.url));
-
-  // persist union memory
-  writeJson(seenPagesPath, Array.from(seenPages));
-  writeJson(seenFilesPath, Array.from(seenFiles));
-
-  // write artifacts, conflating meta with the FIRST REAL ROW (no duplicate row)
-  const nextLevel = L + 1;
-
-  const outPages = newPages.map(url => ({ url }));
-  if (outPages.length > 0) {
-    outPages[0] = { _meta: true, level: nextLevel, kind: "urls", ...outPages[0] };
-  }
-  writeJson(path.join(ARTIFACT_DIR, `urls-level-${nextLevel}.json`), outPages);
-
-  if (newFiles.length > 0) {
-    const outFiles = newFiles.map(f => ({ url: f.url, ext: f.ext || "unknown" }));
-    outFiles[0] = { _meta: true, level: L, kind: "files", ...outFiles[0] };
-    writeJson(path.join(ARTIFACT_DIR, `files-level-${L}.json`), outFiles);
-  } else {
-    const fp = path.join(ARTIFACT_DIR, `files-level-${L}.json`);
-    if (fs.existsSync(fp)) fs.unlinkSync(fp);
-  }
-
-  appendJsonl(path.join(runDir, "dedupe_log.jsonl"), {
-    ts: new Date().toISOString(),
-    run: runTag,
-    level: L,
-    cleared_levels_ge: toClear,
-    pages_new: newPages.length,
-    files_new: newFiles.length
-  });
-
-  res.json({
-    ok: true,
-    run: runTag,
-    level: L,
-    cleared_levels_ge: toClear,
-    pages_new: newPages.length,
-    files_new: newFiles.length,
-    saved_pages: `urls-level-${nextLevel}.json`,
-    saved_files: newFiles.length > 0 ? `files-level-${L}.json` : null
-  });
-});
-
-// wipe everything (optional)
-app.post("/dedupe/reset", (_req, res) => {
-  const { runDir, seenPagesPath, seenFilesPath } = bfsPaths();
-  writeJson(seenPagesPath, []);
-  writeJson(seenFilesPath, []);
-
-  for (const f of fs.readdirSync(runDir)) {
-    if (/^level_pages_\d+\.json$/.test(f) || /^level_files_\d+\.json$/.test(f) || f.endsWith(".jsonl")) {
-      fs.unlinkSync(path.join(runDir, f));
+    for (const f of rec.files || []) {
+      if (f?.url) seenFiles.add(normalizeUrl(f.url));
     }
   }
-  res.json({ ok: true, run: BFS_RUN_TAG });
+
+  return { seenPages, seenFiles };
+}
+
+// ---------- app ----------
+const app = express();
+app.use(express.json({ limit: "50mb" })); // large enough for base64 file payloads
+
+ensureDir(CRAWL_ROOT);
+ensureDir(LEVELS_DIR);
+ensureDir(DOWNLOADS_DIR);
+
+// Health
+app.get("/", (_req, res) => {
+  res.json({ ok: true, root: CRAWL_ROOT });
 });
 
-// ---------- FILE SINK (raw base64; overwrites existing) ----------
 /**
- * POST /sink/raw
- * Body: { url, filename?, b64 }
+ * POST /dedupe/level
+ * body: {
+ *   level: number,
+ *   visited?: [{url}|string] or [string],
+ *   pages?: [{url}|string] or [string],
+ *   files?: [{url, ext}]  (optional; if omitted or empty => no files output)
+ * }
  *
- * Saves to downloads/<termKey>/[filename] (overwrite).
- * (You can extend routing for electorates later; this is the stable baseline.)
+ * Semantics:
+ *  - Replaces stored content for this level (rerun-safe)
+ *  - Produces:
+ *      urls-level-(level+1).json  ONLY if there are new unique pages remaining
+ *      files-level-(level).json   ONLY if there are any files
  */
-app.post("/sink/raw", (req, res) => {
-  const { url, filename, b64 } = req.body || {};
-  if (!url) return res.status(400).json({ ok: false, error: "Missing url" });
-  if (!b64) return res.status(400).json({ ok: false, error: "Missing b64" });
-
-  let buf;
+app.post("/dedupe/level", (req, res) => {
   try {
-    buf = Buffer.from(String(b64), "base64");
-  } catch {
-    return res.status(400).json({ ok: false, error: "Invalid base64" });
+    const level = Number(req.body?.level);
+    if (!Number.isFinite(level) || level < 1) {
+      return res.status(400).json({ ok: false, error: "Invalid level" });
+    }
+
+    // Normalize inputs
+    const inVisitedRaw = req.body?.visited || [];
+    const inPagesRaw = req.body?.pages || [];
+    const inFilesRaw = req.body?.files || [];
+
+    const toUrlList = (raw) =>
+      (Array.isArray(raw) ? raw : [])
+        .filter(r => !isTruthyMetaRow(r))
+        .map(r => (typeof r === "string" ? r : r?.url))
+        .filter(Boolean)
+        .map(normalizeUrl);
+
+    const visited = stableUniq(toUrlList(inVisitedRaw));
+    const pages = stableUniq(toUrlList(inPagesRaw));
+
+    const files = stableUniq(
+      (Array.isArray(inFilesRaw) ? inFilesRaw : [])
+        .filter(r => r && !isTruthyMetaRow(r) && r.url)
+        .map(r => ({
+          url: normalizeUrl(r.url),
+          ext: (r.ext || getExtFromUrl(r.url) || "bin").toLowerCase()
+        }))
+    );
+
+    // Load state and REPLACE this level record
+    const st = loadState();
+    st.levels[String(level)] = { visited, pages, files };
+    saveState(st);
+
+    // Compute seen up to this level (includes visited + pages + files of <= level)
+    const { seenPages, seenFiles } = computeSeenFromState(st, level);
+
+    // Next level pages should be: current 'pages' filtered by all pages already seen in <= level
+    // BUT: because pages are discovered *from* level input, they belong to (level+1).
+    // So we filter against seen up to level (which includes visited seeds etc).
+    const nextPages = pages.filter(u => !seenPages.has(u)); // NOTE: seenPages includes pages itself now
+    // Wait—pages is already in seenPages because we stored it. We need to filter against levels < level+1
+    // Correct approach: seen up to (level-1) PLUS visited of current level (to kill seed repeats),
+    // but not including current pages themselves.
+    const { seenPages: seenPagesBefore } = computeSeenFromState(st, level - 1);
+    const seenForNext = new Set([...seenPagesBefore, ...visited.map(normalizeUrl)]);
+
+    const nextPagesFiltered = pages.filter(u => !seenForNext.has(u));
+
+    // Files at this level: similarly filter against files seen in previous levels (but allow overwrite on rerun)
+    const { seenFiles: seenFilesBefore } = computeSeenFromState(st, level - 1);
+    const filesFiltered = files.filter(f => !seenFilesBefore.has(f.url));
+
+    // Write urls-level-(level+1).json ONLY if any next pages exist
+    const nextLevel = level + 1;
+    const nextUrlsPath = levelPathUrls(nextLevel);
+    const urlsPayload = nextPagesFiltered.map(url => ({ url, level: nextLevel, kind: "urls" })); // meta conflated per-row style
+
+    if (urlsPayload.length > 0) {
+      writeJson(nextUrlsPath, urlsPayload);
+    } else {
+      // do not produce empty file; delete if exists
+      unlinkIfExists(nextUrlsPath);
+    }
+
+    // Write files-level-(level).json ONLY if any files exist
+    const filesPath = levelPathFiles(level);
+    const filesPayload = filesFiltered.map(f => ({ url: f.url, ext: f.ext, level, kind: "files" }));
+
+    if (filesPayload.length > 0) {
+      writeJson(filesPath, filesPayload);
+    } else {
+      unlinkIfExists(filesPath);
+    }
+
+    return res.json({
+      ok: true,
+      level,
+      wrote_next_urls: urlsPayload.length,
+      wrote_files: filesPayload.length,
+      next_urls_path: urlsPayload.length ? nextUrlsPath : null,
+      files_path: filesPayload.length ? filesPath : null
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
-
-  const termKey = termKeyForUrl(url) || "_unresolved";
-  const outDir = path.join(DOWNLOADS_ROOT, termKey);
-  ensureDir(outDir);
-
-  const fname = safePart(filename || path.basename(new URL(url).pathname) || "download.bin");
-  const outPath = path.join(outDir, fname);
-
-  fs.writeFileSync(outPath, buf);
-
-  appendJsonl(path.join(META_DIR, "file_saves.jsonl"), {
-    ts: new Date().toISOString(),
-    url,
-    termKey,
-    saved_as: outPath,
-    bytes: buf.length
-  });
-
-  res.json({ ok: true, saved_as: outPath, termKey, bytes: buf.length });
 });
 
-// ---------- (optional) save runner artifacts directly ----------
-app.post("/artifact/json", (req, res) => {
-  const { artifact_name, payload } = req.body || {};
-  if (!artifact_name || payload === undefined) {
-    return res.status(400).json({ ok: false, error: "Expected { artifact_name, payload }" });
+/**
+ * POST /upload/file
+ * body: { url, ext?, content_base64 }
+ *
+ * Saves into:
+ *   BFS_crawl/downloads/<termKey>/<NNN_ElectorateName?>/<filename>
+ *
+ * Overwrites if exists (as you requested).
+ */
+app.post("/upload/file", (req, res) => {
+  try {
+    const url = normalizeUrl(req.body?.url);
+    const ext = (req.body?.ext || getExtFromUrl(url) || "bin").toLowerCase();
+    const b64 = req.body?.content_base64;
+
+    if (!url || !b64) {
+      return res.status(400).json({ ok: false, error: "Missing url or content_base64" });
+    }
+
+    const { termKey, electorateFolder } = inferPlacementFromUrl(url);
+
+    const termDir = path.join(DOWNLOADS_DIR, termKey);
+    const finalDir = electorateFolder ? path.join(termDir, electorateFolder) : termDir;
+
+    ensureDir(finalDir);
+
+    let filename = safeFileNameFromUrl(url);
+    // If filename has no extension but ext provided, add it
+    if (!/\.[a-z0-9]+$/i.test(filename) && ext) filename += `.${ext}`;
+
+    const outPath = path.join(finalDir, filename);
+    const buf = Buffer.from(b64, "base64");
+
+    fs.writeFileSync(outPath, buf); // overwrite
+    return res.json({ ok: true, saved_to: outPath, bytes: buf.length });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
-  const outPath = path.join(ARTIFACT_DIR, safePart(artifact_name));
-  writeJson(outPath, payload);
-  res.json({ ok: true, saved_as: outPath });
 });
 
-app.post("/artifact/jsonl", (req, res) => {
-  const { artifact_name, item } = req.body || {};
-  if (!artifact_name || item === undefined) {
-    return res.status(400).json({ ok: false, error: "Expected { artifact_name, item }" });
-  }
-  const outPath = path.join(ARTIFACT_DIR, safePart(artifact_name) + ".jsonl");
-  appendJsonl(outPath, item);
-  res.json({ ok: true, saved_as: outPath });
-});
-
-// ---------- start ----------
-const PORT = Number(process.env.PORT || 3000);
 app.listen(PORT, () => {
-  console.log(`sink listening on http://localhost:${PORT}`);
-  console.log(`DOWNLOADS_ROOT=${DOWNLOADS_ROOT}`);
-  console.log(`BFS state folder: ${BFS_RUN_DIR}`);
+  console.log(`sink.js listening on http://localhost:${PORT}`);
+  console.log(`CRAWL_ROOT: ${CRAWL_ROOT}`);
+  console.log(`LEVELS_DIR: ${LEVELS_DIR}`);
+  console.log(`DOWNLOADS_DIR: ${DOWNLOADS_DIR}`);
 });

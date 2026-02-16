@@ -18,7 +18,10 @@
   "homepage": "https://github.com/niusealeo/election-downloader#readme",
   "description": "",
   "dependencies": {
+    "express": "^5.2.1",
+    "multer": "^2.0.2",
     "newman": "^6.2.2",
-    "postman-cli": "^1.29.5"
+    "postman-cli": "^1.29.5",
+    "sanitize-filename": "^1.6.3"
   }
 }

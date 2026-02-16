@@ -1,8 +1,9 @@
 /**
  * sink.js — single server for:
- *  - electorate maps (dual structure per term)
  *  - saving downloaded files to term/electorate folders (overwrite)
- *  - persisting Postman runner datafiles (urls-level / files-level) + run logs
+ *  - persisting Postman runner JSON artifacts (urls-level / files-level) + run logs
+ *  - electorate maps (dual structure per term)
+ *  - RUN-SCOPED dedupe for Discover Links by level (reruns replace level contribution)
  *
  * Install:
  *   npm i express multer sanitize-filename
@@ -17,17 +18,18 @@ const multer = require("multer");
 const sanitize = require("sanitize-filename");
 
 const app = express();
-app.use(express.json({ limit: "200mb" })); // artifacts can be big
+app.use(express.json({ limit: "250mb" }));
 
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 300 * 1024 * 1024 }, // 300MB per file
+  limits: { fileSize: 350 * 1024 * 1024 }, // 350MB per file
 });
 
 const DOWNLOADS_ROOT = path.resolve(process.env.DOWNLOADS_ROOT || "./downloads");
 const META_DIR = path.join(DOWNLOADS_ROOT, "_meta");
 const ARTIFACT_DIR = path.join(META_DIR, "artifacts");
 const ELECTORATES_META_PATH = path.join(META_DIR, "electorates_by_term.json");
+const RUNS_DIR = path.join(META_DIR, "runs");
 
 function ensureDir(p) {
   fs.mkdirSync(p, { recursive: true });
@@ -35,6 +37,7 @@ function ensureDir(p) {
 ensureDir(DOWNLOADS_ROOT);
 ensureDir(META_DIR);
 ensureDir(ARTIFACT_DIR);
+ensureDir(RUNS_DIR);
 
 function readJsonSafe(p, fallback) {
   try {
@@ -53,7 +56,6 @@ function appendJsonl(p, obj) {
 }
 
 function safePart(s) {
-  // keep macrons; sanitize only filesystem illegal chars
   return sanitize(String(s || "")).replace(/\s+/g, "_");
 }
 
@@ -75,7 +77,8 @@ function normalizeUrl(u) {
   }
 }
 
-// GE year -> term number
+// -------------------- Term mapping --------------------
+
 const TERM_BY_GE_YEAR = {
   1996: 45,
   1999: 46,
@@ -89,10 +92,10 @@ const TERM_BY_GE_YEAR = {
   2023: 54,
 };
 
-// Referendums / by-elections: map event year -> parent GE year (extend as needed)
+// Event year -> parent GE year (extend as needed)
 const YEAR_TO_PARENT_GE_YEAR = {
-  2013: 2011, // your rule: 2013 referendum in term_50_(2011)
-  2025: 2023, // your rule: 2025 by-election in term_54_(2023)
+  2013: 2011, // referendum example
+  2025: 2023, // by-election example
 };
 
 function termKeyFromGeYear(geYear) {
@@ -118,7 +121,7 @@ function termKeyForUrl(u) {
   const y = anyYearFromUrl(u);
   if (y && YEAR_TO_PARENT_GE_YEAR[y]) return termKeyFromGeYear(YEAR_TO_PARENT_GE_YEAR[y]);
 
-  // fallback term bands (minimal, extends if you add older years)
+  // fallback bands
   if (y != null) {
     if (y >= 2023 && y <= 2026) return "term_54_(2023)";
     if (y >= 2020 && y <= 2023) return "term_53_(2020)";
@@ -135,40 +138,33 @@ function termKeyForUrl(u) {
   return null;
 }
 
-// Detect electorate number from URL when present
 function electorateNumFromUrl(u) {
-  // 2017+ commonly: electorate-details-68.html
   let m = String(u).match(/electorate-details-(\d+)\.html/i);
   if (m) return Number(m[1]);
 
-  // Some pages: split-votes-electorate-28.html
   m = String(u).match(/split-votes-electorate-(\d+)\.html/i);
   if (m) return Number(m[1]);
 
-  // Older: electorate-27.html / electorate-27-something.html
   m = String(u).match(/electorate-(\d+)[^\/]*\.html/i);
   if (m) return Number(m[1]);
 
   return null;
 }
 
-// Term meta storage
+function cleanElectorateName(name) {
+  return String(name || "")
+    .replace(/\s*\(\.pdf[^)]*\)\s*$/i, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 function loadElectoratesMeta() {
-  return readJsonSafe(ELECTORATES_META_PATH, {}); // { termKey: { official_order, alphabetical_order } }
+  return readJsonSafe(ELECTORATES_META_PATH, {});
 }
 function saveElectoratesMeta(meta) {
   writeJson(ELECTORATES_META_PATH, meta);
 }
 
-// Clean name helper (removes junk suffix you currently have for 1996)
-function cleanElectorateName(name) {
-  return String(name || "")
-    .replace(/\s*\(\.pdf[^)]*\)\s*$/i, "") // remove "(.pdf 338KB)"
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-// Given termKey + URL, return electorate folder name NNN_Name or null (term-level)
 function inferElectorateFolder(termKey, url, meta) {
   const termMeta = meta[termKey];
   const official = termMeta?.official_order; // { "1":"Auckland Central", ... }
@@ -181,7 +177,7 @@ function inferElectorateFolder(termKey, url, meta) {
     return `${String(num).padStart(3, "0")}_${safePart(cleanElectorateName(name))}`;
   }
 
-  // fallback: try matching slugged names in URL
+  // slug match fallback
   const urlLower = decodeURIComponent(String(url)).toLowerCase().replace(/_/g, "-");
   for (const [k, nm] of Object.entries(official)) {
     const name = cleanElectorateName(nm);
@@ -199,36 +195,30 @@ function inferElectorateFolder(termKey, url, meta) {
   return null;
 }
 
-/* -------------------------
- *  A) META ENDPOINTS
- * ------------------------- */
+// -------------------- A) Electorate meta endpoints --------------------
 
-// Overwrite meta for a term (dual structure)
 app.post("/meta/electorates", (req, res) => {
   const { termKey, official_order, alphabetical_order } = req.body || {};
   if (!termKey || !official_order || !alphabetical_order) {
-    return res.status(400).json({
-      ok: false,
-      error: "Expected { termKey, official_order, alphabetical_order }",
-    });
+    return res.status(400).json({ ok: false, error: "Expected { termKey, official_order, alphabetical_order }" });
   }
 
-  // Clean names + ensure official_order is num->name
+  const meta = loadElectoratesMeta();
+
   const cleanedOfficial = {};
   for (const [num, name] of Object.entries(official_order)) {
     const n = Number(num);
-    if (!Number.isFinite(n) || n <= 0) continue;
+    if (!Number.isFinite(n) || n <= 0 || !Number.isInteger(n)) continue;
     const clean = cleanElectorateName(name);
     if (clean) cleanedOfficial[String(n)] = clean;
   }
 
-  // Rebuild alphabetical_order from cleaned official (so it can’t be polluted)
+  // rebuild alpha defensively
   const names = Object.values(cleanedOfficial);
   const alpha = [...names].sort((a, b) => a.localeCompare(b, "en", { sensitivity: "base" }));
   const rebuiltAlpha = {};
   alpha.forEach((nm, i) => (rebuiltAlpha[nm] = i + 1));
 
-  const meta = loadElectoratesMeta();
   meta[termKey] = { official_order: cleanedOfficial, alphabetical_order: rebuiltAlpha };
   saveElectoratesMeta(meta);
 
@@ -239,15 +229,12 @@ app.get("/meta/electorates", (_req, res) => {
   res.json(loadElectoratesMeta());
 });
 
-// Optional: reset all electorate meta (handy if you want a clean rebuild)
 app.post("/meta/electorates/reset", (_req, res) => {
   saveElectoratesMeta({});
   res.json({ ok: true });
 });
 
-/* -------------------------
- *  B) ARTIFACT ENDPOINTS
- * ------------------------- */
+// -------------------- B) Artifact endpoints --------------------
 
 // Save a JSON artifact (urls-level-*.json, files-level-*.json, etc.)
 app.post("/artifact/json", (req, res) => {
@@ -255,31 +242,27 @@ app.post("/artifact/json", (req, res) => {
   if (!artifact_name || payload === undefined) {
     return res.status(400).json({ ok: false, error: "Expected { artifact_name, payload }" });
   }
-
   const outPath = path.join(ARTIFACT_DIR, safePart(artifact_name));
   writeJson(outPath, payload);
   res.json({ ok: true, saved_as: outPath });
 });
 
-// Append an item to JSONL log
+// Append JSONL log
 app.post("/artifact/jsonl", (req, res) => {
   const { artifact_name, item } = req.body || {};
   if (!artifact_name || item === undefined) {
     return res.status(400).json({ ok: false, error: "Expected { artifact_name, item }" });
   }
-
   const outPath = path.join(ARTIFACT_DIR, safePart(artifact_name) + ".jsonl");
   appendJsonl(outPath, item);
   res.json({ ok: true, saved_as: outPath });
 });
 
-/* -------------------------
- *  C) FILE SINK ENDPOINT
- * ------------------------- */
+// -------------------- C) File sink endpoint --------------------
 
 // POST /sink (multipart form-data):
 // - url: source URL
-// - filename: optional (otherwise uses uploaded original filename)
+// - filename: optional
 // - file: binary
 app.post("/sink", upload.single("file"), (req, res) => {
   const srcUrl = req.body?.url;
@@ -304,7 +287,6 @@ app.post("/sink", upload.single("file"), (req, res) => {
   // overwrite
   fs.writeFileSync(outPath, req.file.buffer);
 
-  // optional per-file log
   appendJsonl(path.join(META_DIR, "file_saves.jsonl"), {
     ts: new Date().toISOString(),
     url,
@@ -317,6 +299,152 @@ app.post("/sink", upload.single("file"), (req, res) => {
   res.json({ ok: true, saved_as: outPath, termKey: termKey || null, electorate: electorateFolder || null });
 });
 
+// -------------------- D) RUN-SCOPED DEDUPE (Discover Links) --------------------
+/**
+ * POST /dedupe/level
+ * Body: {
+ *   run_id: "run_...." (required),
+ *   level: 1..N (required),
+ *   pages: [{url}, ...] (required),
+ *   files: [{url, ext}, ...] (optional)
+ * }
+ *
+ * Semantics:
+ * - run-scoped state under: downloads/_meta/runs/<run_id_sanitized>/
+ * - each level rerun replaces its own contribution:
+ *     remove old level contribution from seen sets
+ *     filter new candidate lists against remaining seen (previous levels)
+ *     store new level contribution
+ * - writes:
+ *     artifacts/urls-level-(level+1).json   (new pages only)
+ *     artifacts/files-level-(level).json   (new files only; meta row includes ext:"meta")
+ */
+
+function runPaths(runIdRaw) {
+  const runTag = safePart(runIdRaw);
+  const runDir = path.join(RUNS_DIR, runTag);
+  ensureDir(runDir);
+  return {
+    runTag,
+    runDir,
+    seenPagesPath: path.join(runDir, "seen_pages.json"),
+    seenFilesPath: path.join(runDir, "seen_files.json"),
+  };
+}
+
+app.post("/dedupe/level", (req, res) => {
+  const { run_id, level, pages, files } = req.body || {};
+  if (!run_id) return res.status(400).json({ ok: false, error: "Missing run_id" });
+
+  const lvl = Number(level);
+  if (!Number.isFinite(lvl) || lvl < 1) {
+    return res.status(400).json({ ok: false, error: "Invalid level" });
+  }
+  if (!Array.isArray(pages)) {
+    return res.status(400).json({ ok: false, error: "pages must be an array of {url}" });
+  }
+
+  const { runDir, seenPagesPath, seenFilesPath, runTag } = runPaths(run_id);
+
+  const levelPagesPath = path.join(runDir, `level_pages_${lvl}.json`);
+  const levelFilesPath = path.join(runDir, `level_files_${lvl}.json`);
+
+  // load seen sets
+  const seenPages = new Set(readJsonSafe(seenPagesPath, []));
+  const seenFiles = new Set(readJsonSafe(seenFilesPath, []));
+
+  // remove previous contribution for this level (so rerun replaces it)
+  const oldLevelPages = readJsonSafe(levelPagesPath, []);
+  const oldLevelFiles = readJsonSafe(levelFilesPath, []);
+  for (const u of oldLevelPages) seenPages.delete(u);
+  for (const u of oldLevelFiles) seenFiles.delete(u);
+
+  // filter candidates against seen (i.e., against all other levels that remain)
+  const newPages = [];
+  for (const row of pages) {
+    const u = row?.url;
+    if (!u) continue;
+    if (seenPages.has(u)) continue;
+    seenPages.add(u);
+    newPages.push(u);
+  }
+
+  const inFiles = Array.isArray(files) ? files : [];
+  const newFiles = [];
+  for (const row of inFiles) {
+    const u = row?.url;
+    if (!u) continue;
+    if (seenFiles.has(u)) continue;
+    seenFiles.add(u);
+    newFiles.push({ url: u, ext: row?.ext || "unknown" });
+  }
+
+  // persist level contribution
+  writeJson(levelPagesPath, newPages);
+  writeJson(levelFilesPath, newFiles.map(f => f.url));
+
+  // persist seen sets for the run
+  writeJson(seenPagesPath, Array.from(seenPages));
+  writeJson(seenFilesPath, Array.from(seenFiles));
+
+  // write artifacts (overwrite)
+  const nextLevel = lvl + 1;
+  writeJson(path.join(ARTIFACT_DIR, `urls-level-${nextLevel}.json`), [
+    { _meta: true, level: nextLevel, kind: "urls", url: newPages[0] || "" },
+    ...newPages.map(url => ({ url }))
+  ]);
+
+  if (newFiles.length > 0) {
+    writeJson(path.join(ARTIFACT_DIR, `files-level-${lvl}.json`), [
+      { _meta: true, level: lvl, kind: "files", url: newFiles[0].url, ext: "meta" },
+      ...newFiles
+    ]);
+  } else {
+    // Optional: if rerun produces no files, delete prior artifact for cleanliness
+    const fp = path.join(ARTIFACT_DIR, `files-level-${lvl}.json`);
+    if (fs.existsSync(fp)) fs.unlinkSync(fp);
+  }
+
+  // helpful run log
+  appendJsonl(path.join(runDir, "dedupe_log.jsonl"), {
+    ts: new Date().toISOString(),
+    run_id: runTag,
+    level: lvl,
+    pages_new: newPages.length,
+    files_new: newFiles.length
+  });
+
+  res.json({
+    ok: true,
+    run_id: runTag,
+    level: lvl,
+    pages_new: newPages.length,
+    files_new: newFiles.length,
+    saved_pages: `urls-level-${nextLevel}.json`,
+    saved_files: newFiles.length > 0 ? `files-level-${lvl}.json` : null
+  });
+});
+
+// Reset a run’s dedupe memory (optional)
+app.post("/dedupe/reset", (req, res) => {
+  const { run_id } = req.body || {};
+  if (!run_id) return res.status(400).json({ ok: false, error: "Missing run_id" });
+
+  const { runDir, seenPagesPath, seenFilesPath } = runPaths(run_id);
+  writeJson(seenPagesPath, []);
+  writeJson(seenFilesPath, []);
+
+  // Remove stored per-level contributions too
+  for (const f of fs.readdirSync(runDir)) {
+    if (/^level_pages_\d+\.json$/.test(f) || /^level_files_\d+\.json$/.test(f)) {
+      fs.unlinkSync(path.join(runDir, f));
+    }
+  }
+
+  res.json({ ok: true, run_id: safePart(run_id) });
+});
+
+// -------------------- Health --------------------
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
 const PORT = Number(process.env.PORT || 3000);

@@ -332,12 +332,22 @@ function runPaths(runIdRaw) {
   };
 }
 
+// Helper: list all levels we have stored for this run (from level_pages_*.json files)
+function listStoredLevels(runDir) {
+  const levels = new Set();
+  for (const f of fs.readdirSync(runDir)) {
+    const m = f.match(/^level_pages_(\d+)\.json$/);
+    if (m) levels.add(Number(m[1]));
+  }
+  return Array.from(levels).sort((a, b) => a - b);
+}
+
 app.post("/dedupe/level", (req, res) => {
   const { run_id, level, pages, files } = req.body || {};
   if (!run_id) return res.status(400).json({ ok: false, error: "Missing run_id" });
 
-  const lvl = Number(level);
-  if (!Number.isFinite(lvl) || lvl < 1) {
+  const L = Number(level);
+  if (!Number.isFinite(L) || L < 1) {
     return res.status(400).json({ ok: false, error: "Invalid level" });
   }
   if (!Array.isArray(pages)) {
@@ -346,20 +356,33 @@ app.post("/dedupe/level", (req, res) => {
 
   const { runDir, seenPagesPath, seenFilesPath, runTag } = runPaths(run_id);
 
-  const levelPagesPath = path.join(runDir, `level_pages_${lvl}.json`);
-  const levelFilesPath = path.join(runDir, `level_files_${lvl}.json`);
-
-  // load seen sets
+  // Load current seen memory (union of all previously stored levels in this run)
   const seenPages = new Set(readJsonSafe(seenPagesPath, []));
   const seenFiles = new Set(readJsonSafe(seenFilesPath, []));
 
-  // remove previous contribution for this level (so rerun replaces it)
-  const oldLevelPages = readJsonSafe(levelPagesPath, []);
-  const oldLevelFiles = readJsonSafe(levelFilesPath, []);
-  for (const u of oldLevelPages) seenPages.delete(u);
-  for (const u of oldLevelFiles) seenFiles.delete(u);
+  // STRICT BFS POLICY A:
+  // Remove contributions for ALL levels >= L (so rerun of level L isn't blocked by stale downstream)
+  const storedLevels = listStoredLevels(runDir);
+  const toClear = storedLevels.filter(x => x >= L);
 
-  // filter candidates against seen (i.e., against all other levels that remain)
+  for (const lvl of toClear) {
+    const levelPagesPath = path.join(runDir, `level_pages_${lvl}.json`);
+    const levelFilesPath = path.join(runDir, `level_files_${lvl}.json`);
+
+    const oldPages = readJsonSafe(levelPagesPath, []);
+    const oldFiles = readJsonSafe(levelFilesPath, []);
+
+    for (const u of oldPages) seenPages.delete(u);
+    for (const u of oldFiles) seenFiles.delete(u);
+
+    // Remove the stored level contribution files (they're now invalid)
+    if (fs.existsSync(levelPagesPath)) fs.unlinkSync(levelPagesPath);
+    if (fs.existsSync(levelFilesPath)) fs.unlinkSync(levelFilesPath);
+  }
+
+  // Now seenPages/seenFiles contains only memory of levels < L.
+
+  // Filter incoming candidates against remaining memory
   const newPages = [];
   for (const row of pages) {
     const u = row?.url;
@@ -379,37 +402,39 @@ app.post("/dedupe/level", (req, res) => {
     newFiles.push({ url: u, ext: row?.ext || "unknown" });
   }
 
-  // persist level contribution
-  writeJson(levelPagesPath, newPages);
-  writeJson(levelFilesPath, newFiles.map(f => f.url));
+  // Persist this level's new contribution (for future subtract)
+  writeJson(path.join(runDir, `level_pages_${L}.json`), newPages);
+  writeJson(path.join(runDir, `level_files_${L}.json`), newFiles.map(f => f.url));
 
-  // persist seen sets for the run
+  // Persist updated run memory
   writeJson(seenPagesPath, Array.from(seenPages));
   writeJson(seenFilesPath, Array.from(seenFiles));
 
-  // write artifacts (overwrite)
-  const nextLevel = lvl + 1;
-  writeJson(path.join(ARTIFACT_DIR, `urls-level-${nextLevel}.json`), [
-    { _meta: true, level: nextLevel, kind: "urls", url: newPages[0] || "" },
-    ...newPages.map(url => ({ url }))
-  ]);
+  // Write artifacts (overwrite)
+  const nextLevel = L + 1;
 
+  // urls-level-(L+1).json : conflate meta with first real row (no extra header)
+  const outPages = newPages.map(url => ({ url }));
+  if (outPages.length > 0) {
+    outPages[0] = { _meta: true, level: nextLevel, kind: "urls", ...outPages[0] };
+  }
+  writeJson(path.join(ARTIFACT_DIR, `urls-level-${nextLevel}.json`), outPages);
+
+  // files-level-L.json : conflate meta with first real row (no duplicate); only if any files exist
   if (newFiles.length > 0) {
-    writeJson(path.join(ARTIFACT_DIR, `files-level-${lvl}.json`), [
-      { _meta: true, level: lvl, kind: "files", url: newFiles[0].url, ext: "meta" },
-      ...newFiles
-    ]);
+    const outFiles = newFiles.map(f => ({ url: f.url, ext: f.ext || "unknown" }));
+    outFiles[0] = { _meta: true, level: L, kind: "files", ...outFiles[0] };
+    writeJson(path.join(ARTIFACT_DIR, `files-level-${L}.json`), outFiles);
   } else {
-    // Optional: if rerun produces no files, delete prior artifact for cleanliness
-    const fp = path.join(ARTIFACT_DIR, `files-level-${lvl}.json`);
+    const fp = path.join(ARTIFACT_DIR, `files-level-${L}.json`);
     if (fs.existsSync(fp)) fs.unlinkSync(fp);
   }
 
-  // helpful run log
   appendJsonl(path.join(runDir, "dedupe_log.jsonl"), {
     ts: new Date().toISOString(),
     run_id: runTag,
-    level: lvl,
+    level: L,
+    cleared_levels_ge: toClear,
     pages_new: newPages.length,
     files_new: newFiles.length
   });
@@ -417,11 +442,12 @@ app.post("/dedupe/level", (req, res) => {
   res.json({
     ok: true,
     run_id: runTag,
-    level: lvl,
+    level: L,
+    cleared_levels_ge: toClear,
     pages_new: newPages.length,
     files_new: newFiles.length,
     saved_pages: `urls-level-${nextLevel}.json`,
-    saved_files: newFiles.length > 0 ? `files-level-${lvl}.json` : null
+    saved_files: newFiles.length > 0 ? `files-level-${L}.json` : null
   });
 });
 

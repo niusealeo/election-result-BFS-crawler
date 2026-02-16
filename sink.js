@@ -406,47 +406,81 @@ app.post("/upload/file", (req, res) => {
  *
  * This writes/updates BFS_crawl/_meta/electorates_by_term.json
  */
-app.post("/meta/electorates/upsert", (req, res) => {
-  try {
-    const termKey = String(req.body?.term_key || "").trim();
-    if (!termKey) return res.status(400).json({ ok: false, error: "Missing term_key" });
 
-    const official_order = req.body?.official_order;
-    const alpha_index = req.body?.alpha_index;
+// ---- init folders ----
+ensureDir(BFS_ROOT);
+ensureDir(RUNS_DIR);
+ensureDir(META_DIR);
 
-    if (!official_order || typeof official_order !== "object") {
-      return res.status(400).json({ ok: false, error: "Missing official_order object" });
-    }
-    if (!alpha_index || typeof alpha_index !== "object") {
-      return res.status(400).json({ ok: false, error: "Missing alpha_index object" });
-    }
+// ---- helpers referenced by your endpoint ----
+function loadElectoratesMeta() {
+  return readJsonSafe(ELECTORATES_BY_TERM_PATH, {});
+}
 
-    // basic sanity: official_order keys should be numeric strings
-    const nums = Object.keys(official_order).filter(k => /^\d+$/.test(k)).map(k => Number(k));
-    if (nums.length === 0) {
-      return res.status(400).json({ ok: false, error: "official_order must have numeric string keys" });
-    }
+function saveElectoratesMeta(meta) {
+  writeJson(ELECTORATES_BY_TERM_PATH, meta);
+}
 
-    const db = loadElectoratesByTerm();
-    db[termKey] = {
-      term_key: termKey,
-      ge_year: req.body?.ge_year ?? null,
-      official_order,
-      alpha_index
-    };
-    writeJson(ELECTORATES_BY_TERM_PATH, db);
+function cleanElectorateName(name) {
+  if (!name) return null;
+  let s = String(name).trim();
+  if (!s) return null;
 
-    appendJsonl(ELECTORATES_INGEST_LOG, {
-      ts: new Date().toISOString(),
-      term_key: termKey,
-      count: Object.keys(official_order).length
-    });
+  // normalize whitespace
+  s = s.replace(/\s+/g, " ");
 
-    res.json({ ok: true, saved: ELECTORATES_BY_TERM_PATH, term_key: termKey });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e?.message || e) });
+  // avoid weird placeholders
+  if (s.toLowerCase() === "n/a") return null;
+
+  return s;
+}
+
+// ---- endpoints (kept same API as you posted) ----
+app.post("/meta/electorates", (req, res) => {
+  const { termKey, official_order, alphabetical_order } = req.body || {};
+  if (!termKey || !official_order || !alphabetical_order) {
+    return res.status(400).json({ ok: false, error: "Expected { termKey, official_order, alphabetical_order }" });
   }
+
+  const meta = loadElectoratesMeta();
+
+  const cleanedOfficial = {};
+  for (const [num, name] of Object.entries(official_order)) {
+    const n = Number(num);
+    if (!Number.isFinite(n) || n <= 0 || !Number.isInteger(n)) continue;
+    const clean = cleanElectorateName(name);
+    if (clean) cleanedOfficial[String(n)] = clean;
+  }
+
+  // rebuild alpha defensively from official_order (ignore client alphabetical_order)
+  const names = Object.values(cleanedOfficial);
+  const alpha = [...names].sort((a, b) => a.localeCompare(b, "en", { sensitivity: "base" }));
+  const rebuiltAlpha = {};
+  alpha.forEach((nm, i) => (rebuiltAlpha[nm] = i + 1));
+
+  meta[termKey] = { official_order: cleanedOfficial, alphabetical_order: rebuiltAlpha };
+  saveElectoratesMeta(meta);
+
+  // log
+  appendJsonl(ELECTORATES_INGEST_LOG, {
+    ts: new Date().toISOString(),
+    termKey,
+    count: Object.keys(cleanedOfficial).length
+  });
+
+  res.json({ ok: true, termKey, count: Object.keys(cleanedOfficial).length });
 });
+
+app.get("/meta/electorates", (_req, res) => {
+  res.json(loadElectoratesMeta());
+});
+
+app.post("/meta/electorates/reset", (_req, res) => {
+  saveElectoratesMeta({});
+  appendJsonl(ELECTORATES_INGEST_LOG, { ts: new Date().toISOString(), action: "reset" });
+  res.json({ ok: true });
+});
+
 
 app.listen(PORT, () => {
   console.log(`sink listening on http://localhost:${PORT}`);

@@ -4,14 +4,28 @@
  * Folders:
  *   ./BFS_crawl/
  *      runs/                 (logs)
- *      _meta/                (state + artifacts + electorates_by_term.json)
+ *      _meta/                (state + artifacts + electorates_by_term.json + hashes)
  *   ./downloads/             (SIBLING of BFS_crawl; actual downloaded files)
+ *
+ * Notes:
+ * - Files are saved directly into your existing folder structure:
+ *     downloads/<termKey>/[<electorateFolder>/]<filename>
+ *   (NO extra /pdf/ directory)
+ *
+ * - Supports storing `source_page_url` alongside each file URL in artifacts and upload payload.
+ * - Adds:
+ *     (a) Fallback page fetch (optional) to infer term/electorate when unknown
+ *     (b) SHA256 hashing to detect duplicates even if filenames differ
+ *     (c) Strict PDF header validation + quarantine into downloads/<termKey>/_bad/...
  */
 
 const fs = require("fs");
 const path = require("path");
 const express = require("express");
 const { URL } = require("url");
+const crypto = require("crypto");
+const http = require("http");
+const https = require("https");
 
 // ----------------------- config / paths -----------------------
 const PORT = Number(process.env.PORT || 3000);
@@ -29,6 +43,12 @@ const META_DIR = path.join(BFS_ROOT, "_meta");
 const ARTIFACT_DIR = path.join(META_DIR, "artifacts");
 const STATE_PATH = path.join(META_DIR, "state.json");
 const ELECTORATES_BY_TERM_PATH = path.join(META_DIR, "electorates_by_term.json");
+
+// content hash index (for duplicate detection)
+const HASH_INDEX_PATH = path.join(META_DIR, "hash_index.json");
+
+// Optional network fallback toggle (default true)
+const ENABLE_FALLBACK_FETCH = process.env.ENABLE_FALLBACK_FETCH !== "0";
 
 // ----------------------- helpers -----------------------
 function ensureDir(p) {
@@ -51,7 +71,9 @@ function appendJsonl(p, obj) {
   fs.appendFileSync(p, JSON.stringify(obj) + "\n", "utf8");
 }
 function unlinkIfExists(p) {
-  try { if (fs.existsSync(p)) fs.unlinkSync(p); } catch {}
+  try {
+    if (fs.existsSync(p)) fs.unlinkSync(p);
+  } catch {}
 }
 
 function normalizeUrl(u) {
@@ -76,10 +98,12 @@ function extFromUrl(u) {
 
 function safeFilename(name) {
   // minimal safe: remove path separators + control chars
-  return String(name || "download.bin")
-    .replace(/[\/\\]/g, "_")
-    .replace(/[\u0000-\u001f]/g, "")
-    .slice(0, 240) || "download.bin";
+  return (
+    String(name || "download.bin")
+      .replace(/[\/\\]/g, "_")
+      .replace(/[\u0000-\u001f]/g, "")
+      .slice(0, 240) || "download.bin"
+  );
 }
 
 function filenameFromUrl(u) {
@@ -109,9 +133,27 @@ function stableUniq(arr) {
   const seen = new Set();
   const out = [];
   for (const x of arr) {
-    if (!seen.has(x)) { seen.add(x); out.push(x); }
+    if (!seen.has(x)) {
+      seen.add(x);
+      out.push(x);
+    }
   }
   return out;
+}
+
+function sha256Hex(buf) {
+  return crypto.createHash("sha256").update(buf).digest("hex");
+}
+
+function sniffIsPdf(buf) {
+  // PDF begins with "%PDF-"
+  if (!buf || buf.length < 5) return false;
+  return buf[0] === 0x25 && buf[1] === 0x50 && buf[2] === 0x44 && buf[3] === 0x46 && buf[4] === 0x2d;
+}
+
+function looksLikeHtml(buf) {
+  const head = buf.slice(0, 512).toString("utf8").trim().toLowerCase();
+  return head.startsWith("<!doctype html") || head.startsWith("<html") || head.includes("<head") || head.includes("<title");
 }
 
 // ----------------------- init folders -----------------------
@@ -125,13 +167,14 @@ ensureDir(DOWNLOADS_ROOT);
 const DEDUPE_LOG = path.join(RUNS_DIR, "dedupe_log.jsonl");
 const FILE_SAVES_LOG = path.join(RUNS_DIR, "file_saves.jsonl");
 const ELECTORATES_INGEST_LOG = path.join(RUNS_DIR, "electorates_ingest.jsonl");
+const FETCH_LOG = path.join(RUNS_DIR, "fallback_fetch_log.jsonl");
 
 // ----------------------- BFS state model -----------------------
 /**
  * state.json:
  * {
  *   levels: {
- *     "1": { visited: [url...], pages: [url...], files: [{url, ext}...] },
+ *     "1": { visited: [url...], pages: [url...], files: [{url, ext, source_page_url?}...] },
  *     "2": ...
  *   }
  * }
@@ -151,17 +194,17 @@ function computeSeenUpTo(st, maxLevelInclusive) {
   const seenFiles = new Set();
 
   const levels = Object.keys(st.levels)
-    .map(k => Number(k))
-    .filter(n => Number.isFinite(n))
+    .map((k) => Number(k))
+    .filter((n) => Number.isFinite(n))
     .sort((a, b) => a - b);
 
   for (const L of levels) {
     if (L > maxLevelInclusive) break;
     const rec = st.levels[String(L)];
     if (!rec) continue;
-    for (const u of (rec.visited || [])) seenPages.add(normalizeUrl(u));
-    for (const u of (rec.pages || [])) seenPages.add(normalizeUrl(u));
-    for (const f of (rec.files || [])) if (f?.url) seenFiles.add(normalizeUrl(f.url));
+    for (const u of rec.visited || []) seenPages.add(normalizeUrl(u));
+    for (const u of rec.pages || []) seenPages.add(normalizeUrl(u));
+    for (const f of rec.files || []) if (f?.url) seenFiles.add(normalizeUrl(f.url));
   }
   return { seenPages, seenFiles };
 }
@@ -197,8 +240,8 @@ function termKeyForUrl(u, electoratesByTerm) {
 
   // choose term where term.geYear <= eventYear < nextTerm.geYear
   const terms = Object.keys(electoratesByTerm)
-    .map(k => ({ k, p: termKeyParts(k) }))
-    .filter(x => x.p)
+    .map((k) => ({ k, p: termKeyParts(k) }))
+    .filter((x) => x.p)
     .sort((a, b) => a.p.geYear - b.p.geYear);
 
   for (let i = 0; i < terms.length; i++) {
@@ -251,6 +294,165 @@ function electorateFolderFor(termKey, url, electoratesByTerm) {
   return null;
 }
 
+// ----------------------- fallback fetch for context inference -----------------------
+function httpGetText(u, { maxBytes = 2_000_000, timeoutMs = 25_000, maxRedirects = 5 } = {}) {
+  return new Promise((resolve, reject) => {
+    let urlStr;
+    try {
+      urlStr = new URL(u).toString();
+    } catch {
+      return reject(new Error("Invalid URL"));
+    }
+
+    const lib = urlStr.startsWith("https:") ? https : http;
+
+    const req = lib.get(
+      urlStr,
+      {
+        headers: {
+          "User-Agent": "Mozilla/5.0 (sink.js)",
+          Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        },
+      },
+      (res) => {
+        const status = res.statusCode || 0;
+        const loc = res.headers.location;
+
+        // redirects
+        if (status >= 300 && status < 400 && loc && maxRedirects > 0) {
+          res.resume();
+          const nextUrl = new URL(loc, urlStr).toString();
+          return resolve(httpGetText(nextUrl, { maxBytes, timeoutMs, maxRedirects: maxRedirects - 1 }));
+        }
+
+        const chunks = [];
+        let total = 0;
+
+        res.on("data", (d) => {
+          total += d.length;
+          if (total > maxBytes) {
+            res.destroy(new Error("Response too large"));
+            return;
+          }
+          chunks.push(d);
+        });
+
+        res.on("end", () => {
+          const buf = Buffer.concat(chunks);
+          resolve({ status, finalUrl: urlStr, text: buf.toString("utf8") });
+        });
+      }
+    );
+
+    req.on("error", reject);
+    req.setTimeout(timeoutMs, () => req.destroy(new Error("Timeout")));
+  });
+}
+
+function extractCandidateContextUrlsFromHtml(html) {
+  const out = new Set();
+
+  // Look for electionresults_YYYY paths
+  const reGE = /https?:\/\/[^"' ]+\/electionresults_(\d{4})\/[^"' ]*/gi;
+  let m;
+  while ((m = reGE.exec(html)) !== null) out.add(m[0]);
+
+  // Look for /eNN/ electorate tokens
+  const reE = /https?:\/\/[^"' ]+\/e(\d{1,3})\/[^"' ]*/gi;
+  while ((m = reE.exec(html)) !== null) out.add(m[0]);
+
+  // General absolute URLs
+  // (Keep conservative; only if it looks like electionresults.govt.nz)
+  const reHost = /https?:\/\/(?:www\.)?electionresults\.govt\.nz\/[^"' ]+/gi;
+  while ((m = reHost.exec(html)) !== null) out.add(m[0]);
+
+  return [...out].slice(0, 200);
+}
+
+async function inferFromSourcePage({ sourcePageUrl, electoratesByTerm }) {
+  if (!ENABLE_FALLBACK_FETCH) return { inferredTermKey: null, inferredElectorateFolder: null, note: "fetch_disabled" };
+  if (!sourcePageUrl) return { inferredTermKey: null, inferredElectorateFolder: null, note: "no_source_page" };
+
+  const t0 = Date.now();
+  try {
+    const { status, finalUrl, text } = await httpGetText(sourcePageUrl);
+    const html = String(text || "");
+    const candidates = extractCandidateContextUrlsFromHtml(html);
+
+    // Try term inference from:
+    // - finalUrl
+    // - any linked URLs on the page
+    const urlsToTry = [finalUrl, ...candidates].map(normalizeUrl);
+
+    let inferredTermKey = null;
+    let inferredElectorateFolder = null;
+
+    for (const u of urlsToTry) {
+      const tk = termKeyForUrl(u, electoratesByTerm);
+      if (tk && tk !== "term_unknown") {
+        inferredTermKey = tk;
+        break;
+      }
+    }
+
+    if (inferredTermKey) {
+      for (const u of urlsToTry) {
+        const ef = electorateFolderFor(inferredTermKey, u, electoratesByTerm);
+        if (ef) {
+          inferredElectorateFolder = ef;
+          break;
+        }
+      }
+    }
+
+    appendJsonl(FETCH_LOG, {
+      ts: new Date().toISOString(),
+      source_page_url: sourcePageUrl,
+      status,
+      ms: Date.now() - t0,
+      inferredTermKey,
+      inferredElectorateFolder,
+      candidates_checked: urlsToTry.length,
+    });
+
+    return {
+      inferredTermKey,
+      inferredElectorateFolder,
+      note: "fetched",
+    };
+  } catch (e) {
+    appendJsonl(FETCH_LOG, {
+      ts: new Date().toISOString(),
+      source_page_url: sourcePageUrl,
+      ms: Date.now() - t0,
+      error: String(e?.message || e),
+    });
+    return { inferredTermKey: null, inferredElectorateFolder: null, note: "fetch_failed" };
+  }
+}
+
+// ----------------------- hash index -----------------------
+function loadHashIndex() {
+  // { "<sha256>": { first_seen: "...", bytes: 123, locations: [{path,url,source_page_url,ts}] } }
+  return readJsonSafe(HASH_INDEX_PATH, {});
+}
+function saveHashIndex(idx) {
+  writeJson(HASH_INDEX_PATH, idx);
+}
+function upsertHashIndex(idx, hash, entry) {
+  if (!idx[hash]) {
+    idx[hash] = {
+      first_seen: entry.ts,
+      bytes: entry.bytes,
+      locations: [entry],
+    };
+  } else {
+    const locs = idx[hash].locations || [];
+    locs.push(entry);
+    idx[hash].locations = locs;
+  }
+}
+
 // ----------------------- app -----------------------
 const app = express();
 app.use(express.json({ limit: "750mb" }));
@@ -261,7 +463,8 @@ app.get("/health", (_req, res) => {
     BFS_ROOT,
     DOWNLOADS_ROOT,
     META_DIR,
-    RUNS_DIR
+    RUNS_DIR,
+    ENABLE_FALLBACK_FETCH,
   });
 });
 
@@ -277,7 +480,7 @@ app.post("/dedupe/level", (req, res) => {
     const toUrlArray = (raw) =>
       stableUniq(
         (Array.isArray(raw) ? raw : [])
-          .map(r => (typeof r === "string" ? r : r?.url))
+          .map((r) => (typeof r === "string" ? r : r?.url))
           .filter(Boolean)
           .map(normalizeUrl)
       );
@@ -288,13 +491,14 @@ app.post("/dedupe/level", (req, res) => {
     const inFiles = Array.isArray(req.body?.files) ? req.body.files : [];
     const files = stableUniq(
       inFiles
-        .filter(f => f?.url)
-        .map(f => ({
+        .filter((f) => f?.url)
+        .map((f) => ({
           url: normalizeUrl(f.url),
-          ext: (f.ext || extFromUrl(f.url) || "bin").toLowerCase()
+          ext: (f.ext || extFromUrl(f.url) || "bin").toLowerCase(),
+          source_page_url: f.source_page_url ? normalizeUrl(f.source_page_url) : null,
         }))
-        .map(f => JSON.stringify(f))
-    ).map(s => JSON.parse(s));
+        .map((f) => JSON.stringify(f))
+    ).map((s) => JSON.parse(s));
 
     // Load + replace level record (rerun-safe)
     const st = loadState();
@@ -306,9 +510,9 @@ app.post("/dedupe/level", (req, res) => {
     // - Also exclude current level's visited seeds (so seed won't reappear)
     const { seenPages: seenPagesBefore, seenFiles: seenFilesBefore } = computeSeenUpTo(st, level - 1);
     const seenForNextPages = new Set([...seenPagesBefore, ...visited]);
-    const nextPages = pages.filter(u => !seenForNextPages.has(u));
+    const nextPages = pages.filter((u) => !seenForNextPages.has(u));
 
-    const filesOut = files.filter(f => !seenFilesBefore.has(f.url));
+    const filesOut = files.filter((f) => !seenFilesBefore.has(f.url));
 
     // Write artifacts into BFS_crawl/_meta/artifacts
     const nextLevel = level + 1;
@@ -317,14 +521,23 @@ app.post("/dedupe/level", (req, res) => {
 
     if (nextPages.length > 0) {
       // per-row carries level/kind; no separate meta row
-      writeJson(nextUrlsPath, nextPages.map(url => ({ url, level: nextLevel, kind: "urls" })));
+      writeJson(nextUrlsPath, nextPages.map((url) => ({ url, level: nextLevel, kind: "urls" })));
     } else {
       // IMPORTANT: do not produce an empty file
       unlinkIfExists(nextUrlsPath);
     }
 
     if (filesOut.length > 0) {
-      writeJson(filesPath, filesOut.map(f => ({ url: f.url, ext: f.ext, level, kind: "files" })));
+      writeJson(
+        filesPath,
+        filesOut.map((f) => ({
+          url: f.url,
+          ext: f.ext,
+          level,
+          kind: "files",
+          source_page_url: f.source_page_url || null,
+        }))
+      );
     } else {
       unlinkIfExists(filesPath);
     }
@@ -336,7 +549,7 @@ app.post("/dedupe/level", (req, res) => {
       pages_in: pages.length,
       pages_out_next: nextPages.length,
       files_in: files.length,
-      files_out: filesOut.length
+      files_out: filesOut.length,
     });
 
     res.json({
@@ -346,7 +559,7 @@ app.post("/dedupe/level", (req, res) => {
       wrote_next_urls: nextPages.length,
       wrote_files: filesOut.length,
       next_urls_path: nextPages.length ? nextUrlsPath : null,
-      files_path: filesOut.length ? filesPath : null
+      files_path: filesOut.length ? filesPath : null,
     });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e?.message || e) });
@@ -354,17 +567,44 @@ app.post("/dedupe/level", (req, res) => {
 });
 
 // ---------- 2) UPLOAD FILE (save into term/electorate structure) ----------
-app.post("/upload/file", (req, res) => {
+app.post("/upload/file", async (req, res) => {
   try {
     const url = normalizeUrl(req.body?.url);
     const ext = (req.body?.ext || extFromUrl(url) || "bin").toLowerCase();
     const b64 = req.body?.content_base64;
 
+    // New: source page URL (optional)
+    const sourcePageUrl = req.body?.source_page_url ? normalizeUrl(req.body.source_page_url) : null;
+
     if (!url || !b64) return res.status(400).json({ ok: false, error: "Missing url or content_base64" });
 
     const electoratesByTerm = loadElectoratesByTerm();
-    const termKey = termKeyForUrl(url, electoratesByTerm);
-    const electorateFolder = electorateFolderFor(termKey, url, electoratesByTerm);
+
+    // First-pass inference from file URL
+    let termKey = termKeyForUrl(url, electoratesByTerm);
+    let electorateFolder = termKey !== "term_unknown" ? electorateFolderFor(termKey, url, electoratesByTerm) : null;
+
+    // If unknown or no electorate folder, try sourcePageUrl heuristics first (no fetch)
+    if (sourcePageUrl) {
+      if (termKey === "term_unknown") {
+        const tk2 = termKeyForUrl(sourcePageUrl, electoratesByTerm);
+        if (tk2 && tk2 !== "term_unknown") termKey = tk2;
+      }
+      if (!electorateFolder && termKey !== "term_unknown") {
+        const ef2 = electorateFolderFor(termKey, sourcePageUrl, electoratesByTerm);
+        if (ef2) electorateFolder = ef2;
+      }
+    }
+
+    // If still not enough context, optionally fetch source page HTML and infer
+    let fallbackNote = null;
+    if ((termKey === "term_unknown" || !electorateFolder) && sourcePageUrl) {
+      const inferred = await inferFromSourcePage({ sourcePageUrl, electoratesByTerm });
+      fallbackNote = inferred.note;
+
+      if (termKey === "term_unknown" && inferred.inferredTermKey) termKey = inferred.inferredTermKey;
+      if (!electorateFolder && inferred.inferredElectorateFolder) electorateFolder = inferred.inferredElectorateFolder;
+    }
 
     const termDir = path.join(DOWNLOADS_ROOT, termKey);
     const finalDir = electorateFolder ? path.join(termDir, electorateFolder) : termDir;
@@ -374,43 +614,81 @@ app.post("/upload/file", (req, res) => {
     if (!/\.[a-z0-9]+$/i.test(filename) && ext) filename += `.${ext}`;
     filename = safeFilename(filename);
 
-    const outPath = path.join(finalDir, filename);
     const buf = Buffer.from(String(b64), "base64");
-    fs.writeFileSync(outPath, buf); // overwrite
+
+    // Strict PDF validation + quarantine
+    const shouldBePdf = ext === "pdf" || filename.toLowerCase().endsWith(".pdf");
+    let note = "ok";
+    let outDir = finalDir;
+    let outPath = path.join(outDir, filename);
+
+    if (shouldBePdf && !sniffIsPdf(buf)) {
+      note = looksLikeHtml(buf) ? "bad_pdf_got_html" : "bad_pdf_not_pdf";
+      outDir = path.join(termDir, "_bad");
+      ensureDir(outDir);
+
+      // Keep original basename but avoid overwriting by adding suffix
+      const base = filename.replace(/\.pdf$/i, "");
+      const badName = safeFilename(`${base}__${note}.html`);
+      outPath = path.join(outDir, badName);
+    }
+
+    // Hashing (duplicate detection)
+    const hash = sha256Hex(buf);
+    const hashIdx = loadHashIndex();
+    const isDuplicate = !!hashIdx[hash];
+
+    // Write file (overwrite allowed; you can later change behavior if you want)
+    fs.writeFileSync(outPath, buf);
+
+    const ts = new Date().toISOString();
+
+    // Update hash index
+    upsertHashIndex(hashIdx, hash, {
+      ts,
+      bytes: buf.length,
+      path: outPath,
+      url,
+      source_page_url: sourcePageUrl || null,
+      termKey,
+      electorateFolder: electorateFolder || null,
+      note,
+    });
+    saveHashIndex(hashIdx);
 
     appendJsonl(FILE_SAVES_LOG, {
-      ts: new Date().toISOString(),
+      ts,
       url,
+      source_page_url: sourcePageUrl || null,
       termKey,
       electorateFolder: electorateFolder || null,
       saved_to: outPath,
-      bytes: buf.length
+      bytes: buf.length,
+      ext,
+      hash,
+      duplicate_of: isDuplicate ? (hashIdx[hash]?.locations?.[0]?.path || null) : null,
+      note,
+      fallback_note: fallbackNote,
     });
 
-    res.json({ ok: true, saved_to: outPath, bytes: buf.length });
+    res.json({
+      ok: true,
+      saved_to: outPath,
+      bytes: buf.length,
+      termKey,
+      electorateFolder: electorateFolder || null,
+      note,
+      hash,
+      duplicate: isDuplicate,
+      duplicate_of: isDuplicate ? (hashIdx[hash]?.locations?.[0]?.path || null) : null,
+      fallback_note: fallbackNote,
+    });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
 
 // ---------- 3) ELECTORATES INGEST (build electorates_by_term.json from Postman) ----------
-/**
- * POST /meta/electorates/upsert
- * Body:
- * {
- *   term_key: "term_54_(2023)",
- *   ge_year: 2023,              // optional, informational
- *   official_order: { "1": "Te Tai Tokerau", ... },     // REQUIRED
- *   alpha_index: { "Auckland Central": 1, ... }         // REQUIRED
- * }
- *
- * This writes/updates BFS_crawl/_meta/electorates_by_term.json
- */
-
-// ---- init folders ----
-ensureDir(BFS_ROOT);
-ensureDir(RUNS_DIR);
-ensureDir(META_DIR);
 
 // ---- helpers referenced by your endpoint ----
 function loadElectoratesMeta() {
@@ -435,7 +713,7 @@ function cleanElectorateName(name) {
   return s;
 }
 
-// ---- endpoints (kept same API as you posted) ----
+// ---- endpoints ----
 app.post("/meta/electorates", (req, res) => {
   const { termKey, official_order, alphabetical_order } = req.body || {};
   if (!termKey || !official_order || !alphabetical_order) {
@@ -465,7 +743,7 @@ app.post("/meta/electorates", (req, res) => {
   appendJsonl(ELECTORATES_INGEST_LOG, {
     ts: new Date().toISOString(),
     termKey,
-    count: Object.keys(cleanedOfficial).length
+    count: Object.keys(cleanedOfficial).length,
   });
 
   res.json({ ok: true, termKey, count: Object.keys(cleanedOfficial).length });
@@ -481,7 +759,6 @@ app.post("/meta/electorates/reset", (_req, res) => {
   res.json({ ok: true });
 });
 
-
 app.listen(PORT, () => {
   console.log(`sink listening on http://localhost:${PORT}`);
   console.log(`BFS_ROOT: ${BFS_ROOT}`);
@@ -489,4 +766,6 @@ app.listen(PORT, () => {
   console.log(`META_DIR: ${META_DIR}`);
   console.log(`RUNS_DIR: ${RUNS_DIR}`);
   console.log(`electorates_by_term.json: ${ELECTORATES_BY_TERM_PATH}`);
+  console.log(`hash_index.json: ${HASH_INDEX_PATH}`);
+  console.log(`ENABLE_FALLBACK_FETCH: ${ENABLE_FALLBACK_FETCH}`);
 });

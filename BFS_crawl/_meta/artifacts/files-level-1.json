@@ -1,0 +1,16 @@
+[
+  {
+    "_meta": true,
+    "level": 1,
+    "kind": "files",
+    "url": "https://www.electionresults.govt.nz/2017_mt_albert_byelection/Mt_Albert_27.xls",
+    "ext": "xls",
+    "source_page_url": "https://www.electionresults.govt.nz/2017_mt_albert_byelection/",
+    "comment": "Had to manually save these two file urls because they did not show up in static html response page."
+  },
+  {
+    "url": "https://www.electionresults.govt.nz/2016_mt_roskill_byelection/2016-mtroskill-by-election-stats.xls",
+    "ext": "xls",
+    "source_page_url": "https://www.electionresults.govt.nz/2016_mt_roskill_byelection/"
+  }
+]

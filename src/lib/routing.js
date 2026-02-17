@@ -1,5 +1,5 @@
 const path = require("path");
-const { normalizeUrl, extFromUrl } = require("./urlnorm");
+const { extFromUrl, normalizeUrl } = require("./urlnorm");
 
 function asciiFold(s) {
   return String(s || "")
@@ -17,7 +17,7 @@ function termKeyParts(termKey) {
 function termKeyForUrl(u, electoratesByTerm) {
   const url = String(u || "");
 
-  // GE archive URL: /electionresults_YYYY/
+  // /electionresults_YYYY/
   let m = url.match(/\/electionresults_(\d{4})\//i);
   if (m) {
     const geYear = Number(m[1]);
@@ -56,7 +56,7 @@ function electorateFolderFor(termKey, url, electoratesByTerm) {
 
   const u = String(url || "");
 
-  // Pattern /eNN/
+  // /eNN/
   let m = u.match(/\/e(\d{1,3})\//i);
   if (m) {
     const n = Number(m[1]);
@@ -64,7 +64,7 @@ function electorateFolderFor(termKey, url, electoratesByTerm) {
     if (name) return `${String(n).padStart(3, "0")}_${name}`;
   }
 
-  // Pattern /YYYY_slug_byelection/
+  // /YYYY_slug_byelection/
   m = u.match(/\/\d{4}_([^/]+?)_(?:byelection|by-election)\//i);
   if (m) {
     const guess = asciiFold(m[1].replace(/[_-]+/g, " "));
@@ -75,7 +75,7 @@ function electorateFolderFor(termKey, url, electoratesByTerm) {
     }
   }
 
-  // Fallback: match electorate name tokens in URL
+  // token match
   const foldedUrl = asciiFold(u.replace(/[^a-z0-9]+/g, " "));
   for (const [numStr, name] of Object.entries(t.official_order)) {
     const foldedName = asciiFold(name);
@@ -96,22 +96,35 @@ function safeFilename(name) {
     String(name || "download.bin")
       .replace(/[\/\\]/g, "_")
       .replace(/[\u0000-\u001f]/g, "")
+      .replace(/\s+/g, " ")
+      .trim()
       .slice(0, 240) || "download.bin"
   );
+}
+
+function decodePossiblyTwice(s) {
+  let out = String(s || "");
+  try { out = decodeURIComponent(out); } catch {}
+  // handle double-encoding
+  if (/%[0-9a-f]{2}/i.test(out)) {
+    try { out = decodeURIComponent(out); } catch {}
+  }
+  return out;
 }
 
 function filenameFromUrl(u) {
   try {
     const { URL } = require("url");
     const U = new URL(u);
-    const base = path.basename(U.pathname);
-    return safeFilename(base || "download.bin");
+    let base = path.basename(U.pathname) || "download.bin";
+    base = decodePossiblyTwice(base);
+    return safeFilename(base);
   } catch {
     return "download.bin";
   }
 }
 
-function resolveSavePath({ downloadsRoot, url, ext, source_page_url, electoratesByTerm }) {
+function resolveSavePath({ downloadsRoot, url, ext, source_page_url, electoratesByTerm, filenameOverride }) {
   const fileUrl = normalizeUrl(url);
   const sourceUrl = source_page_url ? normalizeUrl(source_page_url) : null;
   const inferredExt = (ext || extFromUrl(fileUrl) || "bin").toLowerCase();
@@ -133,7 +146,10 @@ function resolveSavePath({ downloadsRoot, url, ext, source_page_url, electorates
   const termDir = path.join(downloadsRoot, termKey);
   const finalDir = electorateFolder ? path.join(termDir, electorateFolder) : termDir;
 
-  let filename = filenameFromUrl(fileUrl);
+  let filename = filenameOverride
+    ? safeFilename(decodePossiblyTwice(filenameOverride))
+    : filenameFromUrl(fileUrl);
+
   if (!/\.[a-z0-9]+$/i.test(filename) && inferredExt) filename += `.${inferredExt}`;
   filename = safeFilename(filename);
 

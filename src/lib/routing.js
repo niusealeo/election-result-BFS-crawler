@@ -18,6 +18,58 @@ function termKeyParts(termKey) {
   const m = String(termKey).match(/^term_(\d+)_\((\d{4})\)$/);
   if (!m) return null;
   return { termNo: Number(m[1]), geYear: Number(m[2]) };
+
+function inferTermKeyFromEventYear(eventYear, electoratesByTerm) {
+  if (!Number.isFinite(eventYear)) return null;
+
+  const terms = Object.keys(electoratesByTerm || {})
+    .map((k) => ({ k, p: termKeyParts(k) }))
+    .filter((x) => x.p && Number.isFinite(x.p.termNo) && Number.isFinite(x.p.geYear))
+    .sort((a, b) => a.p.geYear - b.p.geYear);
+
+  if (!terms.length) return null;
+
+  const min = terms[0].p;
+  const max = terms[terms.length - 1].p;
+
+  // If event is within scraped range, pick greatest GE year <= eventYear.
+  let candidate = null;
+  for (const t of terms) {
+    if (t.p.geYear <= eventYear) candidate = t;
+    else break;
+  }
+  if (candidate) return candidate.k;
+
+  // Event predates earliest scraped term. Try infer a prior GE year on 3-year cadence.
+  // Keep term_extra_(YYYY) fallback if cadence doesn't fit.
+  const diff = min.geYear - eventYear;
+  // choose the largest geYear <= eventYear by stepping back in 3-year increments
+  const stepsBack = Math.floor((diff + 2) / 3); // +2 gives "ceiling" in integers
+  const inferredGeYear = min.geYear - stepsBack * 3;
+
+  if (inferredGeYear <= eventYear && (min.geYear - inferredGeYear) % 3 === 0) {
+    const termNo = min.termNo - ((min.geYear - inferredGeYear) / 3);
+    if (Number.isFinite(termNo) && termNo > 0) {
+      return `term_${termNo}_(${inferredGeYear})`;
+    }
+  }
+
+  // Event after max scraped term (future) — try infer forward on 3-year cadence.
+  const diffF = eventYear - max.geYear;
+  if (diffF > 0) {
+    const stepsF = Math.floor(diffF / 3);
+    const inferredGeYearF = max.geYear + stepsF * 3;
+    if (inferredGeYearF <= eventYear && (inferredGeYearF - max.geYear) % 3 === 0) {
+      const termNo = max.termNo + ((inferredGeYearF - max.geYear) / 3);
+      if (Number.isFinite(termNo) && termNo > 0) {
+        return `term_${termNo}_(${inferredGeYearF})`;
+      }
+    }
+  }
+
+  return null;
+}
+
 }
 
 function termKeyForUrl(u, electoratesByTerm) {
@@ -27,33 +79,70 @@ function termKeyForUrl(u, electoratesByTerm) {
   let m = url.match(/\/electionresults_(\d{4})\//i);
   if (m) {
     const geYear = Number(m[1]);
-    for (const k of Object.keys(electoratesByTerm || {})) {
-      const p = termKeyParts(k);
-      if (p && p.geYear === geYear) return k;
-    }
+    const exact = inferTermKeyFromEventYear(geYear, electoratesByTerm);
+    if (exact) return exact;
+    return `term_extra_(${geYear})`;
   }
 
-  // by-election / referendum includes event year
-  m = url.match(/\/(\d{4})_[^/]*(byelection|by-election|referendum)\//i);
+  // by-election / referendum includes event year in path
+  m = url.match(/\/(\d{4})_[^/]*(byelection|by-election|referenda?|referendum)\//i);
   let eventYear = m ? Number(m[1]) : null;
+
+  // fallback: first 4-digit year anywhere
   if (!eventYear) {
-    m = url.match(/(19\d{2}|20\d{2})/);
+    m = url.match(/\b(19\d{2}|20\d{2})\b/);
     if (m) eventYear = Number(m[1]);
   }
+
   if (!eventYear) return "term_unknown";
+
+  const inferred = inferTermKeyFromEventYear(eventYear, electoratesByTerm);
+  if (inferred) return inferred;
+
+  // Keep a dedicated bucket for inconsistencies (unknown past/future).
+  return `term_extra_(${eventYear})`;
+}
+
+function termKeyForEvent(eventYear, monthOpt, electoratesByTerm) {
+  // monthOpt: 1-12, used for by-elections/referenda when we can parse a date.
+  // If an event occurs early in a GE year (e.g. Feb 2017), it belongs to the prior term.
+  if (!Number.isFinite(eventYear)) return "term_unknown";
+
+  const base = inferTermKeyFromEventYear(eventYear, electoratesByTerm) || `term_extra_(${eventYear})`;
+  if (!monthOpt || !Number.isFinite(monthOpt)) return base;
 
   const terms = Object.keys(electoratesByTerm || {})
     .map((k) => ({ k, p: termKeyParts(k) }))
     .filter((x) => x.p)
     .sort((a, b) => a.p.geYear - b.p.geYear);
 
-  for (let i = 0; i < terms.length; i++) {
-    const cur = terms[i];
-    const next = terms[i + 1];
-    if (!next) return cur.k;
-    if (eventYear >= cur.p.geYear && eventYear < next.p.geYear) return cur.k;
-  }
-  return terms[terms.length - 1]?.k || "term_unknown";
+  // Only apply the early-year override when this year is a known GE year in the scraped list.
+  const idx = terms.findIndex((t) => t.p.geYear === eventYear);
+  if (idx > 0 && monthOpt <= 6) return terms[idx - 1].k;
+
+  return base;
+}
+
+function parseMonthFromNameOrUrl(s) {
+  const t = decodeHtmlEntities(String(s || ""));
+  const m = t.match(/\b(\d{1,2})\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{4})\b/i);
+  if (!m) return null;
+  const monthName = m[2].toLowerCase();
+  const map = {
+    january: 1,
+    february: 2,
+    march: 3,
+    april: 4,
+    may: 5,
+    june: 6,
+    july: 7,
+    august: 8,
+    september: 9,
+    october: 10,
+    november: 11,
+    december: 12,
+  };
+  return map[monthName] || null;
 }
 
 function electorateFolderFor(termKey, url, electoratesByTerm) {
@@ -95,6 +184,27 @@ function electorateFolderFor(termKey, url, electoratesByTerm) {
     const n = Number(m[1]);
     const name = official[String(n)];
     if (name) return `${String(n).padStart(3, "0")}_${name}`;
+  }
+
+  // SPECIAL: Terms 47–51 exports often look like e9_part8_cand_63.csv
+  // Here e9 = election id, and the trailing cand_63 / party_63 / part_63 indicates electorate number.
+  // Apply ONLY when we are in an archive election-id path OR the filename itself starts with e<digits>_.
+  const looksLikeElectionIdPrefix = /^e\d{1,3}_/i.test(filenameRaw);
+  if (isArchiveElectionIdPath || looksLikeElectionIdPrefix) {
+    // cand_##
+    let mm = filenameRaw.match(/(?:^|[_-])cand[_-]?(\d{1,3})(?:\D|$)/i);
+    if (mm) {
+      const n = Number(mm[1]);
+      const name = official[String(n)];
+      if (name) return `${String(n).padStart(3, "0")}_${name}`;
+    }
+    // part_## or party_##
+    mm = filenameRaw.match(/(?:^|[_-])(part|party)[_-]?(\d{1,3})(?:\D|$)/i);
+    if (mm) {
+      const n = Number(mm[2]);
+      const name = official[String(n)];
+      if (name) return `${String(n).padStart(3, "0")}_${name}`;
+    }
   }
 
   // PRIORITY 2a: explicit electorate/voting-place numbering in filename
@@ -197,28 +307,39 @@ function resolveSavePath({ downloadsRoot, url, ext, source_page_url, electorates
   const sourceUrl = source_page_url ? normalizeUrl(source_page_url) : null;
   const inferredExt = (ext || extFromUrl(fileUrl) || "bin").toLowerCase();
 
-  // By-elections are treated as "state changes" within a term.
-  // Store ALL by-election files under a term-level folder instead of an electorate folder.
+  // State-change bundles
   const isByElection = /(byelection|by-election)/i.test(fileUrl) || (sourceUrl ? /(byelection|by-election)/i.test(sourceUrl) : false);
+  const isReferendum = /(referenda?|referendum)/i.test(fileUrl) || (sourceUrl ? /(referenda?|referendum)/i.test(sourceUrl) : false);
+  const isStateChange = isByElection || isReferendum;
 
-  let termKey = termKeyForUrl(fileUrl, electoratesByTerm);
+  // When possible, parse a month from filename/URL to avoid mis-bucketing early-year events (e.g. Feb 2017).
+  const fnameForDate = filenameOverride ? String(filenameOverride) : filenameFromUrl(fileUrl);
+  const monthOpt = parseMonthFromNameOrUrl(fnameForDate) || (sourceUrl ? parseMonthFromNameOrUrl(sourceUrl) : null) || parseMonthFromNameOrUrl(fileUrl);
+
+  const yearMatch = fileUrl.match(/(19\d{2}|20\d{2})/);
+  const eventYear = yearMatch ? Number(yearMatch[1]) : NaN;
+
+  let termKey = isStateChange ? termKeyForEvent(eventYear, monthOpt, electoratesByTerm) : termKeyForUrl(fileUrl, electoratesByTerm);
   if (termKey === "term_unknown" && sourceUrl) {
     const tk2 = termKeyForUrl(sourceUrl, electoratesByTerm);
     if (tk2 && tk2 !== "term_unknown") termKey = tk2;
   }
 
   let electorateFolder = null;
-  if (termKey !== "term_unknown" && !isByElection) {
+  if (termKey !== "term_unknown" && !isStateChange) {
     electorateFolder = electorateFolderFor(termKey, fileUrl, electoratesByTerm);
     if (!electorateFolder && sourceUrl) {
       electorateFolder = electorateFolderFor(termKey, sourceUrl, electoratesByTerm);
     }
   }
 
-  const termDir = path.join(downloadsRoot, termKey);
+  // If we can't infer a term, keep it at downloads root (not inside term_unknown).
+  const termDir = termKey === "term_unknown" ? downloadsRoot : path.join(downloadsRoot, termKey);
   const finalDir = isByElection
     ? path.join(termDir, "by-elections")
-    : (electorateFolder ? path.join(termDir, electorateFolder) : termDir);
+    : isReferendum
+      ? path.join(termDir, "referenda")
+      : (electorateFolder ? path.join(termDir, electorateFolder) : termDir);
 
   let filename = filenameOverride ? safeFilename(filenameOverride) : filenameFromUrl(fileUrl);
   if (!/\.[a-z0-9]+$/i.test(filename) && inferredExt) filename += `.${inferredExt}`;
@@ -228,6 +349,7 @@ function resolveSavePath({ downloadsRoot, url, ext, source_page_url, electorates
     termKey,
     electorateFolder,
     isByElection,
+    isReferendum,
     termDir,
     finalDir,
     filename,
@@ -238,6 +360,7 @@ function resolveSavePath({ downloadsRoot, url, ext, source_page_url, electorates
 
 module.exports = {
   termKeyForUrl,
+  termKeyForEvent,
   electorateFolderFor,
   resolveSavePath,
 };

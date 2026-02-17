@@ -1,15 +1,30 @@
 const express = require("express");
 const fs = require("fs");
+const path = require("path");
 
-const { readJsonSafe, writeJson } = require("../lib/fsx");
+const { ensureDir, readJsonSafe, writeJson } = require("../lib/fsx");
 const { appendJsonl } = require("../lib/jsonl");
+const { toAbsolute } = require("../lib/paths");
+
+function manifestPath(cfg, level) {
+  return path.join(cfg.LEVEL_FILES_DIR, `${String(level)}.json`);
+}
+
+function minLevel(levelsObj) {
+  const ks = Object.keys(levelsObj || {})
+    .map(Number)
+    .filter((n) => Number.isFinite(n));
+  if (!ks.length) return Infinity;
+  return Math.min(...ks);
+}
 
 function makeRunsRouter(cfg) {
   const r = express.Router();
 
-  // POST /runs/start/files
-  // Body: { level: <number> }
-  // Clears prior collected results *for that level* from the hash index.
+  // Hard reset for a BFS file-download level, BUT keep any file also used
+  // by an earlier level (< level).
+  //
+  // Body: { level: number }
   r.post("/runs/start/files", (req, res) => {
     try {
       const level = Number(req.body?.level);
@@ -18,57 +33,84 @@ function makeRunsRouter(cfg) {
       }
       const L = String(level);
 
+      ensureDir(cfg.LEVEL_FILES_DIR);
+
+      const mPath = manifestPath(cfg, level);
+      const manifest = readJsonSafe(mPath, { level, files: [] });
+
       const idx = readJsonSafe(cfg.DOWNLOADED_HASH_INDEX_PATH, {});
-      let removedLevelRefs = 0;
+
       let deletedFiles = 0;
+      let keptBecauseEarlier = 0;
+      let missingFiles = 0;
+      let removedLevelRefs = 0;
       let deletedHashes = 0;
 
-      for (const [sha, rec] of Object.entries(idx)) {
-        if (!rec || typeof rec !== "object") continue;
-        if (!rec.levels || !rec.levels[L]) continue;
+      for (const item of manifest.files || []) {
+        const sha = item?.sha256;
+        const savedRel = item?.saved_to;
 
-        delete rec.levels[L];
-        removedLevelRefs++;
+        const rec = sha ? idx[sha] : null;
 
-        // recompute primary_level/primary_order if needed
-        const levels = Object.keys(rec.levels || {}).map(Number).filter(Number.isFinite);
-        if (levels.length === 0) {
-          // no remaining references => delete file + delete hash entry
-          if (rec.saved_to && fs.existsSync(rec.saved_to)) {
-            try { fs.unlinkSync(rec.saved_to); deletedFiles++; } catch {}
-          }
-          delete idx[sha];
-          deletedHashes++;
+        // Remove this level's membership.
+        if (rec?.levels && rec.levels[L]) {
+          delete rec.levels[L];
+          removedLevelRefs++;
+        }
+
+        // Keep if any earlier level still references it.
+        const earlierMin = rec?.levels ? minLevel(rec.levels) : Infinity;
+        const usedByEarlier = earlierMin < level;
+        if (usedByEarlier) {
+          keptBecauseEarlier++;
           continue;
         }
 
-        // if the primary level was this level, we no longer know the true earliest order;
-        // keep primary_level as min remaining, and primary_order as Infinity (will be corrected on next upload).
-        const newPrimary = Math.min(...levels);
-        if (Number(rec.primary_level) === level) {
-          rec.primary_level = newPrimary;
-          rec.primary_order = Number.POSITIVE_INFINITY;
+        if (savedRel) {
+          const savedAbs = toAbsolute(savedRel);
+          if (fs.existsSync(savedAbs)) {
+            try {
+              fs.unlinkSync(savedAbs);
+              deletedFiles++;
+            } catch {
+              // best-effort
+            }
+          } else {
+            missingFiles++;
+          }
         }
 
-        rec.last_seen_ts = new Date().toISOString();
+        // If no remaining levels, drop the hash record.
+        if (rec && (!rec.levels || Object.keys(rec.levels).length === 0)) {
+          delete idx[sha];
+          deletedHashes++;
+        } else if (rec) {
+          rec.last_seen_ts = new Date().toISOString();
+        }
       }
 
+      // Overwrite manifest for this level as fresh.
+      writeJson(mPath, { level, files: [], started_ts: new Date().toISOString() });
       writeJson(cfg.DOWNLOADED_HASH_INDEX_PATH, idx);
 
       appendJsonl(cfg.LOG_LEVEL_RESETS, {
         ts: new Date().toISOString(),
         kind: "files",
         level,
-        removedLevelRefs,
         deletedFiles,
+        keptBecauseEarlier,
+        missingFiles,
+        removedLevelRefs,
         deletedHashes,
       });
 
       return res.json({
         ok: true,
         level,
-        removedLevelRefs,
         deletedFiles,
+        keptBecauseEarlier,
+        missingFiles,
+        removedLevelRefs,
         deletedHashes,
       });
     } catch (e) {

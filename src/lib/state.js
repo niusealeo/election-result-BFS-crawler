@@ -2,7 +2,7 @@ const { readJsonSafe, writeJson } = require("./fsx");
 const { normalizeUrl } = require("./urlnorm");
 
 function defaultState() {
-  return { levels: {} };
+  return { levels: {}, file_hashes: {}, term_dirs_created: {} };
 }
 
 function loadState(statePath) {

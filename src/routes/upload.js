@@ -4,47 +4,39 @@ const fs = require("fs");
 const crypto = require("crypto");
 
 const { resolveSavePath } = require("../lib/routing");
-const { loadElectoratesMeta } = require("../lib/electorates");
+const { loadElectoratesMeta, ensureTermElectorateFolders } = require("../lib/electorates");
 const { ensureDir, readJsonSafe, writeJson } = require("../lib/fsx");
 const { sniffIsPdf, looksLikeHtml } = require("../lib/pdfguard");
 const { appendJsonl } = require("../lib/jsonl");
-const { normalizeUrl } = require("../lib/urlnorm");
+const { toAbsolute, toRelative } = require("../lib/paths");
 
-function uniqPush(arr, v, limit = 2000) {
-  if (!v) return arr || [];
-  if (!Array.isArray(arr)) arr = [];
-  if (!arr.includes(v)) arr.push(v);
-  if (arr.length > limit) arr = arr.slice(arr.length - limit);
-  return arr;
+function manifestPath(cfg, level) {
+  return path.join(cfg.LEVEL_FILES_DIR, `${String(level)}.json`);
 }
 
-function levelKey(level) {
-  const n = Number(level);
-  return Number.isFinite(n) ? String(n) : null;
-}
-
-function isEarlier(levelA, orderA, levelB, orderB) {
-  // Earlier BFS means lower level; tie-breaker is lower order.
-  if (levelA < levelB) return true;
-  if (levelA > levelB) return false;
-  return orderA < orderB;
-}
-
-function safeMove(oldPath, newPath) {
-  if (oldPath === newPath) return;
-  ensureDir(path.dirname(newPath));
-  try {
-    fs.renameSync(oldPath, newPath);
-  } catch {
-    // cross-device or permission fallback: copy then unlink
-    fs.copyFileSync(oldPath, newPath);
-    try { fs.unlinkSync(oldPath); } catch {}
+function appendToLevelManifest(cfg, level, entry) {
+  ensureDir(cfg.LEVEL_FILES_DIR);
+  const p = manifestPath(cfg, level);
+  const m = readJsonSafe(p, { level, files: [] });
+  const key = `${entry.sha256}::${entry.saved_to}`;
+  const seen = new Set((m.files || []).map((x) => `${x.sha256}::${x.saved_to}`));
+  if (!seen.has(key)) {
+    m.files.push(entry);
+    writeJson(p, m);
   }
 }
 
 function makeUploadRouter(cfg) {
   const r = express.Router();
 
+  // POST /upload/file
+  // Body:
+  //  - url
+  //  - ext
+  //  - filename (optional override)
+  //  - source_page_url (optional)
+  //  - bfs_level (required)
+  //  - content_base64 (required)
   r.post("/upload/file", (req, res) => {
     try {
       const url = req.body?.url;
@@ -52,35 +44,26 @@ function makeUploadRouter(cfg) {
       const ext = req.body?.ext;
       const filenameOverride = req.body?.filename ? String(req.body.filename) : null;
       const source_page_url = req.body?.source_page_url ? String(req.body.source_page_url) : null;
+      const bfs_level = Number(req.body?.bfs_level);
 
-      // NEW: BFS metadata from Postman
-      const bfs_level_raw = req.body?.bfs_level;
-      const bfs_order_raw = req.body?.bfs_order;
-
-      const bfs_level = Number(bfs_level_raw);
-      const bfs_order = Number(bfs_order_raw);
-
-      const bfsLevelOk = Number.isFinite(bfs_level) && bfs_level >= 1;
-      const bfsOrderOk = Number.isFinite(bfs_order) && bfs_order >= 0;
-
-      if (!url || !b64) return res.status(400).json({ ok: false, error: "Missing url or content_base64" });
-      if (!bfsLevelOk || !bfsOrderOk) {
-        return res.status(400).json({ ok: false, error: "Missing/invalid bfs_level or bfs_order" });
+      if (!Number.isFinite(bfs_level) || bfs_level < 1) {
+        return res.status(400).json({ ok: false, error: "Missing/invalid bfs_level" });
+      }
+      if (!url || !b64) {
+        return res.status(400).json({ ok: false, error: "Missing url or content_base64" });
       }
 
-      const normUrl = normalizeUrl(url);
-      const normSource = source_page_url ? normalizeUrl(source_page_url) : null;
+      const electoratesByTerm = loadElectoratesMeta(cfg.ELECTORATES_BY_TERM_PATH);
 
-      // Decode bytes + hash (dedupe key is content)
+      // Decode bytes + hash by content
       const buf = Buffer.from(String(b64), "base64");
       const sha256 = crypto.createHash("sha256").update(buf).digest("hex");
 
-      // Load index: sha256 -> canonical record
+      // Load global hash index (stores relative paths)
       const idx = readJsonSafe(cfg.DOWNLOADED_HASH_INDEX_PATH, {});
-      const prev = idx[sha256];
+      const existing = idx[sha256];
 
-      // Decide the desired save path for THIS appearance (used if it becomes primary)
-      const electoratesByTerm = loadElectoratesMeta(cfg.ELECTORATES_BY_TERM_PATH);
+      // Resolve intended save path for THIS occurrence
       const route = resolveSavePath({
         downloadsRoot: cfg.DOWNLOADS_ROOT,
         url,
@@ -90,165 +73,145 @@ function makeUploadRouter(cfg) {
         filenameOverride,
       });
 
+      // Ensure canonical electorate folders exist for the term
+      if (route.termKey && route.termKey !== "term_unknown") {
+        ensureTermElectorateFolders({
+          downloadsRoot: cfg.DOWNLOADS_ROOT,
+          termKey: route.termKey,
+          electoratesByTerm,
+        });
+      }
+
       const shouldBePdf = route.ext === "pdf" || route.filename.toLowerCase().endsWith(".pdf");
 
-      // If already have this hash saved somewhere, update provenance + maybe promote if earlier
-      if (prev && prev.saved_to && fs.existsSync(prev.saved_to)) {
-        prev.last_seen_ts = new Date().toISOString();
-        prev.urls = uniqPush(prev.urls, normUrl);
-        prev.sources = uniqPush(prev.sources, normSource);
-        prev.names = uniqPush(prev.names, filenameOverride || route.filename);
-        prev.levels = prev.levels || {};
-        prev.levels[String(bfs_level)] = true;
+      // If already saved, just mark membership for this level and record in manifest.
+      if (existing?.saved_to) {
+        const existingAbs = toAbsolute(existing.saved_to);
+        if (fs.existsSync(existingAbs)) {
+          existing.levels = existing.levels || {};
+          existing.levels[String(bfs_level)] = true;
+          existing.last_seen_ts = new Date().toISOString();
 
-        const primary_level = Number(prev.primary_level ?? Infinity);
-        const primary_order = Number(prev.primary_order ?? Infinity);
+          // If we can now route it into an electorate folder whereas it previously lived in term root,
+          // upgrade location (more specific beats less specific).
+          // We ONLY upgrade if the new target is more specific (has electorateFolder) and
+          // the existing saved_to is NOT already inside that electorate folder.
+          const wantElect = !!route.electorateFolder;
+          const haveElect = existing.electorateFolder ? true : false;
+          if (wantElect && !haveElect) {
+            // Move canonical file to new location.
+            let targetAbs = route.outPath;
+            let note = "promoted_to_electorate";
+            if (shouldBePdf && !sniffIsPdf(buf)) {
+              note = looksLikeHtml(buf) ? "promoted_bad_pdf_got_html" : "promoted_bad_pdf_not_pdf";
+              const badDir = path.join(route.termDir, "_bad");
+              ensureDir(badDir);
+              const base = route.filename.replace(/\.pdf$/i, "");
+              const badName = `${base}__${note}.html`.replace(/[\/\\]/g, "_");
+              targetAbs = path.join(badDir, badName);
+            }
 
-        // Promote if this appearance is earlier than the current primary
-        if (isEarlier(bfs_level, bfs_order, primary_level, primary_order)) {
-          // Move canonical file to the new earlier location (so “priority = earliest BFS”)
-          // Keep PDF quarantine logic consistent: if this is a PDF but bytes aren't PDF, we quarantine.
-          let targetPath = route.outPath;
-          let note = "promoted_ok";
+            ensureDir(path.dirname(targetAbs));
+            try {
+              fs.renameSync(existingAbs, targetAbs);
+            } catch {
+              fs.copyFileSync(existingAbs, targetAbs);
+              try { fs.unlinkSync(existingAbs); } catch {}
+            }
 
-          if (shouldBePdf && !sniffIsPdf(buf)) {
-            note = looksLikeHtml(buf) ? "promoted_bad_pdf_got_html" : "promoted_bad_pdf_not_pdf";
-            const badDir = path.join(route.termDir, "_bad");
-            ensureDir(badDir);
-            const base = route.filename.replace(/\.pdf$/i, "");
-            const badName = `${base}__${note}.html`.replace(/[\/\\]/g, "_");
-            targetPath = path.join(badDir, badName);
+            existing.saved_to = toRelative(targetAbs);
+            existing.termKey = route.termKey;
+            existing.electorateFolder = route.electorateFolder || null;
+            existing.ext = route.ext;
+            existing.note = note;
           }
 
-          safeMove(prev.saved_to, targetPath);
-          prev.saved_to = targetPath;
-          prev.ext = route.ext;
-          prev.termKey = route.termKey;
-          prev.electorateFolder = route.electorateFolder || null;
-          prev.note = note;
-          prev.primary_level = bfs_level;
-          prev.primary_order = bfs_order;
-
+          idx[sha256] = existing;
           writeJson(cfg.DOWNLOADED_HASH_INDEX_PATH, idx);
+
+          appendToLevelManifest(cfg, bfs_level, { sha256, saved_to: existing.saved_to });
 
           appendJsonl(cfg.LOG_FILE_SAVES, {
             ts: new Date().toISOString(),
-            url: normUrl,
-            source_page_url: normSource,
-            saved_to: prev.saved_to,
+            url,
+            source_page_url,
+            termKey: existing.termKey || route.termKey,
+            electorateFolder: existing.electorateFolder || route.electorateFolder || null,
+            saved_to: existing.saved_to,
             bytes: buf.length,
-            ext: prev.ext,
-            note,
+            ext: existing.ext || route.ext,
+            note: "duplicate_content_skipped",
             sha256,
             bfs_level,
-            bfs_order,
           });
 
           return res.json({
             ok: true,
             skipped: true,
-            promoted: true,
-            note,
-            saved_to: prev.saved_to,
-            bytes: buf.length,
+            note: "duplicate_content_skipped",
+            saved_to: existing.saved_to,
             sha256,
-            bfs_level,
-            bfs_order,
           });
         }
-
-        // Not earlier => skip write
-        writeJson(cfg.DOWNLOADED_HASH_INDEX_PATH, idx);
-
-        appendJsonl(cfg.LOG_FILE_SAVES, {
-          ts: new Date().toISOString(),
-          url: normUrl,
-          source_page_url: normSource,
-          saved_to: prev.saved_to,
-          bytes: buf.length,
-          ext: prev.ext || route.ext,
-          note: "duplicate_skipped",
-          sha256,
-          bfs_level,
-          bfs_order,
-        });
-
-        return res.json({
-          ok: true,
-          skipped: true,
-          promoted: false,
-          note: "duplicate_skipped",
-          saved_to: prev.saved_to,
-          bytes: buf.length,
-          sha256,
-          bfs_level,
-          bfs_order,
-        });
+        // If record exists but file missing, fall through and re-save.
       }
 
-      // Otherwise: save as new canonical (for now)
+      // Save new canonical file
       ensureDir(route.finalDir);
 
-      let outPath = route.outPath;
+      let outAbs = route.outPath;
       let note = "ok";
-
       if (shouldBePdf && !sniffIsPdf(buf)) {
         note = looksLikeHtml(buf) ? "bad_pdf_got_html" : "bad_pdf_not_pdf";
         const badDir = path.join(route.termDir, "_bad");
         ensureDir(badDir);
-
         const base = route.filename.replace(/\.pdf$/i, "");
         const badName = `${base}__${note}.html`.replace(/[\/\\]/g, "_");
-        outPath = path.join(badDir, badName);
+        outAbs = path.join(badDir, badName);
       }
 
-      fs.writeFileSync(outPath, buf);
+      fs.writeFileSync(outAbs, buf);
+      const outRel = toRelative(outAbs);
 
       idx[sha256] = {
         sha256,
+        saved_to: outRel,
         bytes: buf.length,
         ext: route.ext,
-        saved_to: outPath,
         termKey: route.termKey,
         electorateFolder: route.electorateFolder || null,
-        first_seen_ts: prev?.first_seen_ts || new Date().toISOString(),
+        url,
+        source_page_url,
         last_seen_ts: new Date().toISOString(),
-        urls: uniqPush(prev?.urls, normUrl),
-        sources: uniqPush(prev?.sources, normSource),
-        names: uniqPush(prev?.names, filenameOverride || route.filename),
         levels: { [String(bfs_level)]: true },
-        primary_level: bfs_level,
-        primary_order: bfs_order,
         note,
       };
-
       writeJson(cfg.DOWNLOADED_HASH_INDEX_PATH, idx);
+
+      appendToLevelManifest(cfg, bfs_level, { sha256, saved_to: outRel });
 
       appendJsonl(cfg.LOG_FILE_SAVES, {
         ts: new Date().toISOString(),
-        url: normUrl,
-        source_page_url: normSource,
+        url,
+        source_page_url,
         termKey: route.termKey,
         electorateFolder: route.electorateFolder || null,
-        saved_to: outPath,
+        saved_to: outRel,
         bytes: buf.length,
         ext: route.ext,
         note,
         sha256,
         bfs_level,
-        bfs_order,
       });
 
       return res.json({
         ok: true,
-        saved_to: outPath,
+        saved_to: outRel,
         bytes: buf.length,
-        sha256,
         termKey: route.termKey,
         electorateFolder: route.electorateFolder || null,
         note,
-        bfs_level,
-        bfs_order,
+        sha256,
       });
     } catch (e) {
       return res.status(500).json({ ok: false, error: String(e?.message || e) });

@@ -1,11 +1,17 @@
 const path = require("path");
 const { normalizeUrl, extFromUrl } = require("./urlnorm");
+const { decodeHtmlEntities } = require("./html");
 
 function asciiFold(s) {
   return String(s || "")
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "")
     .toLowerCase();
+}
+
+function compactFold(s) {
+  // fold + remove non-alnum so "Auckland Central" matches "AucklandCentral"
+  return asciiFold(decodeHtmlEntities(String(s || ""))).replace(/[^a-z0-9]+/g, "");
 }
 
 function termKeyParts(termKey) {
@@ -55,7 +61,10 @@ function electorateFolderFor(termKey, url, electoratesByTerm) {
   if (!t?.official_order) return null;
 
   const u = String(url || "");
-  const official = t.official_order;
+  // decode HTML entities in official names (term 49 uses &#257; etc)
+  const official = Object.fromEntries(
+    Object.entries(t.official_order).map(([k, v]) => [k, decodeHtmlEntities(v)])
+  );
 
   // Decode filename from URL for pattern matching
   let filenameRaw = "";
@@ -74,10 +83,15 @@ function electorateFolderFor(termKey, url, electoratesByTerm) {
 
   const filenameFold = asciiFold(filenameRaw);
   const urlFold = asciiFold(u);
+  const filenameCompact = compactFold(filenameRaw);
 
-  // PRIORITY 1: URL path contains /eNN/
+  // IMPORTANT: In GE archive URLs (electionresults_YYYY), the path segment /e9/ is the *election id*,
+  // not an electorate. Do NOT treat it as electorate 9.
+  const isArchiveElectionIdPath = /\/electionresults_\d{4}\/e\d{1,3}\//i.test(u);
+
+  // PRIORITY 1: URL path contains /eNN/ (but ignore GE archive election-id paths like /electionresults_1999/e9/)
   let m = u.match(/\/e(\d{1,3})\//i);
-  if (m) {
+  if (m && !isArchiveElectionIdPath) {
     const n = Number(m[1]);
     const name = official[String(n)];
     if (name) return `${String(n).padStart(3, "0")}_${name}`;
@@ -124,7 +138,7 @@ function electorateFolderFor(termKey, url, electoratesByTerm) {
   m = u.match(/\/\d{4}_([^/]+?)_(?:byelection|by-election)\//i);
   if (m) {
     const guess = asciiFold(m[1].replace(/[_-]+/g, " "));
-    for (const [numStr, name] of Object.entries(t.official_order)) {
+    for (const [numStr, name] of Object.entries(official)) {
       if (asciiFold(name) === guess) {
         return `${String(Number(numStr)).padStart(3, "0")}_${name}`;
       }
@@ -135,7 +149,15 @@ function electorateFolderFor(termKey, url, electoratesByTerm) {
   for (const [numStr, name] of Object.entries(official)) {
     const foldedName = asciiFold(name);
     if (!foldedName) continue;
-    if (filenameFold.includes(foldedName) || urlFold.includes(foldedName)) {
+
+    // normal containment
+    const matchLoose = filenameFold.includes(foldedName) || urlFold.includes(foldedName);
+
+    // compact containment: "AucklandCentral" vs "Auckland Central"
+    const nameCompact = compactFold(name);
+    const matchCompact = nameCompact && filenameCompact.includes(nameCompact);
+
+    if (matchLoose || matchCompact) {
       const n = Number(numStr);
       return `${String(n).padStart(3, "0")}_${name}`;
     }
@@ -175,6 +197,10 @@ function resolveSavePath({ downloadsRoot, url, ext, source_page_url, electorates
   const sourceUrl = source_page_url ? normalizeUrl(source_page_url) : null;
   const inferredExt = (ext || extFromUrl(fileUrl) || "bin").toLowerCase();
 
+  // By-elections are treated as "state changes" within a term.
+  // Store ALL by-election files under a term-level folder instead of an electorate folder.
+  const isByElection = /(byelection|by-election)/i.test(fileUrl) || (sourceUrl ? /(byelection|by-election)/i.test(sourceUrl) : false);
+
   let termKey = termKeyForUrl(fileUrl, electoratesByTerm);
   if (termKey === "term_unknown" && sourceUrl) {
     const tk2 = termKeyForUrl(sourceUrl, electoratesByTerm);
@@ -182,7 +208,7 @@ function resolveSavePath({ downloadsRoot, url, ext, source_page_url, electorates
   }
 
   let electorateFolder = null;
-  if (termKey !== "term_unknown") {
+  if (termKey !== "term_unknown" && !isByElection) {
     electorateFolder = electorateFolderFor(termKey, fileUrl, electoratesByTerm);
     if (!electorateFolder && sourceUrl) {
       electorateFolder = electorateFolderFor(termKey, sourceUrl, electoratesByTerm);
@@ -190,7 +216,9 @@ function resolveSavePath({ downloadsRoot, url, ext, source_page_url, electorates
   }
 
   const termDir = path.join(downloadsRoot, termKey);
-  const finalDir = electorateFolder ? path.join(termDir, electorateFolder) : termDir;
+  const finalDir = isByElection
+    ? path.join(termDir, "by-elections")
+    : (electorateFolder ? path.join(termDir, electorateFolder) : termDir);
 
   let filename = filenameOverride ? safeFilename(filenameOverride) : filenameFromUrl(fileUrl);
   if (!/\.[a-z0-9]+$/i.test(filename) && inferredExt) filename += `.${inferredExt}`;
@@ -199,6 +227,7 @@ function resolveSavePath({ downloadsRoot, url, ext, source_page_url, electorates
   return {
     termKey,
     electorateFolder,
+    isByElection,
     termDir,
     finalDir,
     filename,

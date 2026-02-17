@@ -1,9 +1,10 @@
 const path = require("path");
 const { readJsonSafe, writeJson, ensureDir } = require("./fsx");
+const { decodeHtmlEntities } = require("./html");
 
 function cleanElectorateName(name) {
   if (!name) return null;
-  let s = String(name).trim();
+  let s = decodeHtmlEntities(String(name)).trim();
   if (!s) return null;
   s = s.replace(/\s+/g, " ");
   if (s.toLowerCase() === "n/a") return null;
@@ -31,7 +32,7 @@ function ensureTermElectorateFolders({ downloadsRoot, termKey, electoratesByTerm
   ensureDir(termDir);
 
   const entries = Object.entries(t.official_order)
-    .map(([k, v]) => ({ n: Number(k), name: v }))
+    .map(([k, v]) => ({ n: Number(k), name: cleanElectorateName(v) }))
     .filter((x) => Number.isFinite(x.n) && x.n > 0 && x.name)
     .sort((a, b) => a.n - b.n);
 

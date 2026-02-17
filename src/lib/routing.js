@@ -196,25 +196,28 @@ function electorateFolderFor(termKey, url, electoratesByTerm) {
   }
 
   // SPECIAL: Terms 47–51 exports often look like e9_part8_cand_63.csv
-  // Here e9 = election id, and the trailing cand_63 / party_63 / part_63 indicates electorate number.
-  // Apply ONLY when we are in an archive election-id path OR the filename itself starts with e<digits>_.
-  const looksLikeElectionIdPrefix = /^e\d{1,3}_/i.test(filenameRaw);
-  if (isArchiveElectionIdPath || looksLikeElectionIdPrefix) {
-    // cand_##
-    let mm = filenameRaw.match(/(?:^|[_-])cand[_-]?(\d{1,3})(?:\D|$)/i);
-    if (mm) {
-      const n = Number(mm[1]);
-      const name = official[String(n)];
-      if (name) return `${String(n).padStart(3, "0")}_${name}`;
-    }
-    // part_## or party_##
-    mm = filenameRaw.match(/(?:^|[_-])(part|party)[_-]?(\d{1,3})(?:\D|$)/i);
-    if (mm) {
-      const n = Number(mm[2]);
-      const name = official[String(n)];
-      if (name) return `${String(n).padStart(3, "0")}_${name}`;
-    }
+// Here e9 = election id, and only trailing cand_## or party_## indicates electorate.
+const looksLikeElectionIdPrefix = /^e\d{1,3}_/i.test(filenameRaw);
+
+if (isArchiveElectionIdPath || looksLikeElectionIdPrefix) {
+
+  // cand_##
+  let mm = filenameRaw.match(/(?:^|[_-])cand[_-]?(\d{1,3})(?=\D|$)/i);
+  if (mm) {
+    const n = Number(mm[1]);
+    const name = official[String(n)];
+    if (name) return `${String(n).padStart(3, "0")}_${name}`;
   }
+
+  // party_##
+  mm = filenameRaw.match(/(?:^|[_-])party[_-]?(\d{1,3})(?=\D|$)/i);
+  if (mm) {
+    const n = Number(mm[1]);
+    const name = official[String(n)];
+    if (name) return `${String(n).padStart(3, "0")}_${name}`;
+  }
+}
+
 
   // PRIORITY 2a: explicit electorate/voting-place numbering in filename
   m = filenameRaw.match(/(?:^|[_\-\s])(electorate|voting-place)[_\-\s]?(\d{1,3})(?=\D|$)/i);

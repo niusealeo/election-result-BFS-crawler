@@ -1,7 +1,8 @@
 {
   "info": {
-    "_postman_id": "68affbb6-d3a2-43f9-b96d-f945eea51e7d",
+    "_postman_id": "fed29af4-fd55-499b-b123-624e5fc80c03",
     "name": "NZ Elections",
+    "description": "This Breadth First Search Crawler requires an initial seed url in a Postman collections runner commpatible json format to begin. This crawler collects urls and identifies several data file types.\n\n[urls-level-1.json](https://github.com/niusealeo/election-result-BFS-crawler/blob/main/BFS_crawl/_meta/artifacts/urls-level-1.json) is available to use as an example of a top level domain to begin searching the website: [https://www.electionresults.govt.nz/](https://www.electionresults.govt.nz/) , but any website url could be used instead.\n\nThis Postman collection runner \"API\" requires to be run locally on a Postman desktop app so it can work side-by-side with a locally served \"Sink\" file download manager in the Git repo here: [https://github.com/niusealeo/election-result-BFS-crawler](https://github.com/niusealeo/election-result-BFS-crawler)\n\nTo begin the first collection run, select the \"Runs\" option, choose only \"Discover Links\", upload the urls-level-1.json seed file into the test data, and then run the NZ Elections collection.\n\nA next level urls-level-2.json should have have been issued by the \"Sink\" into a [BFS_crawl](https://github.com/niusealeo/election-result-BFS-crawler/tree/main/BFS_crawl)/[_meta](https://github.com/niusealeo/election-result-BFS-crawler/tree/main/BFS_crawl/_meta)/[artifacts](https://github.com/niusealeo/election-result-BFS-crawler/tree/main/BFS_crawl/_meta/artifacts) directory. If the static html page returned by the seed url also contained file links with extensions xls, xlsx, csv, txt, pdf, zip, then a files-level-1.json should have been produced (but not in the case of the [https://www.electionresults.govt.nz/](https://www.electionresults.govt.nz/) landing page which doesn't have file urls).\n\nThe collections run can then be manually repeated with each subsequent urls-level-X.json, until satisifed. The BFS collections would eventually return all the urls in the static html of an entire \"closed\" website system, but \"open\" websites with external links could potentially produce an \\~unlimited series of urls-levels, depending on which external websites they are linking to.\n\n\"Get Electorate Enumeration\" performs a similar task, but lists the official and alphabetic order of the electorates in each MMP election. [Run these urls](https://github.com/niusealeo/election-result-BFS-crawler/blob/main/BFS_crawl/_meta/electorate-map-urls.json) in the test data to get the electorate lists for 1996-2023.\n\nThe lists of files-level-X.json can then also be downloaded into the Sink downloads directory using the same steps with the Postman \"Download Files\" collection runner. All the files are hashed into an index to ensure no identical files are downloaded even if they have different names or have been stored in multiple places on the website.\n\n\"Sink\" is currently configured to expect data files from the NZ Elections website which it organises into an election directory structure. \"Sink\" might be capable of receiving data files from any website, though they would likely be dumped directly into the downloads folder with minimal organisation.\n\nThis BFS Crawler should be used on trusted websites to ensure that safe files are downloaded.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
     "_exporter_id": "2650823"
   },
@@ -228,7 +229,7 @@
       "response": []
     },
     {
-      "name": "Download File",
+      "name": "Download Files",
       "event": [
         {
           "listen": "test",

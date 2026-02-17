@@ -4,6 +4,8 @@ This “sink” is a small local Node/Express API that exists purely to support 
 
 Postman is doing the network work (fetch pages, download files), but Postman is bad at persistent state across many iterations and levels. The sink is our final dedupe net and our local filesystem writer, so the crawl stays deterministic and restartable.
 
+Link to Postman collections runner workspace here: https://www.postman.com/willscire/bfs-election-crawler/collection/2650823-fed29af4-fd55-499b-b123-624e5fc80c03
+
 Think of it like:
 Postman = crawler client  
 Sink = crawl brain + disk writer

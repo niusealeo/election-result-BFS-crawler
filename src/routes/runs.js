@@ -5,6 +5,7 @@ const path = require("path");
 const { ensureDir, readJsonSafe, writeJson } = require("../lib/fsx");
 const { appendJsonl } = require("../lib/jsonl");
 const { toAbsolute } = require("../lib/paths");
+const { withLock } = require("../lib/lock");
 
 function manifestPath(cfg, level) {
   return path.join(cfg.LEVEL_FILES_DIR, `${String(level)}.json`);
@@ -25,7 +26,7 @@ function makeRunsRouter(cfg) {
   // by an earlier level (< level).
   //
   // Body: { level: number }
-  r.post("/runs/start/files", (req, res) => {
+  r.post("/runs/start/files", async (req, res) => {
     try {
       const level = Number(req.body?.level);
       if (!Number.isFinite(level) || level < 1) {
@@ -33,7 +34,8 @@ function makeRunsRouter(cfg) {
       }
       const L = String(level);
 
-      ensureDir(cfg.LEVEL_FILES_DIR);
+      return await withLock(() => {
+        ensureDir(cfg.LEVEL_FILES_DIR);
 
       const mPath = manifestPath(cfg, level);
       const manifest = readJsonSafe(mPath, { level, files: [] });
@@ -112,6 +114,7 @@ function makeRunsRouter(cfg) {
         missingFiles,
         removedLevelRefs,
         deletedHashes,
+      });
       });
     } catch (e) {
       return res.status(500).json({ ok: false, error: String(e?.message || e) });

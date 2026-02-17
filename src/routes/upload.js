@@ -37,7 +37,7 @@ function makeUploadRouter(cfg) {
   //  - source_page_url (optional)
   //  - bfs_level (required)
   //  - content_base64 (required)
-  r.post("/upload/file", (req, res) => {
+  r.post("/upload/file", async (req, res) => {
     try {
       const url = req.body?.url;
       const b64 = req.body?.content_base64;
@@ -59,6 +59,8 @@ function makeUploadRouter(cfg) {
       const buf = Buffer.from(String(b64), "base64");
       const sha256 = crypto.createHash("sha256").update(buf).digest("hex");
 
+      // ---- Serialize RMW state updates (hash index + manifests) ----
+      return await withLock(() => {
       // Load global hash index (stores relative paths)
       const idx = readJsonSafe(cfg.DOWNLOADED_HASH_INDEX_PATH, {});
       const existing = idx[sha256];
@@ -212,6 +214,7 @@ function makeUploadRouter(cfg) {
         electorateFolder: route.electorateFolder || null,
         note,
         sha256,
+      });
       });
     } catch (e) {
       return res.status(500).json({ ok: false, error: String(e?.message || e) });

@@ -9,6 +9,7 @@ const { ensureDir, readJsonSafe, writeJson } = require("../lib/fsx");
 const { sniffIsPdf, looksLikeHtml } = require("../lib/pdfguard");
 const { appendJsonl } = require("../lib/jsonl");
 const { toAbsolute, toRelative } = require("../lib/paths");
+const { withLock } = require("../lib/lock");
 
 function manifestPath(cfg, level) {
   return path.join(cfg.LEVEL_FILES_DIR, `${String(level)}.json`);

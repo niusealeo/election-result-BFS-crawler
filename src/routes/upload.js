@@ -11,6 +11,99 @@ const { appendJsonl } = require("../lib/jsonl");
 const { toAbsolute, toRelative } = require("../lib/paths");
 const { withLock } = require("../lib/lock");
 
+function asArrayUniqueStrings(v) {
+  const arr = Array.isArray(v) ? v : (v ? [v] : []);
+  const out = [];
+  const seen = new Set();
+  for (const x of arr) {
+    if (x === null || x === undefined) continue;
+    const s = String(x);
+    if (!s) continue;
+    if (!seen.has(s)) { seen.add(s); out.push(s); }
+  }
+  return out;
+}
+
+function asArrayUniqueNumbers(v) {
+  // Accept legacy { "2": true } objects as well as arrays.
+  let arr = [];
+  if (Array.isArray(v)) arr = v;
+  else if (v && typeof v === "object") arr = Object.keys(v);
+  else if (v !== null && v !== undefined) arr = [v];
+  const out = [];
+  const seen = new Set();
+  for (const x of arr) {
+    const n = Number(x);
+    if (!Number.isFinite(n)) continue;
+    if (!seen.has(n)) { seen.add(n); out.push(n); }
+  }
+  out.sort((a,b)=>a-b);
+  return out;
+}
+
+function normalizeHashRec(rec) {
+  if (!rec || typeof rec !== "object") return null;
+  // Sources is the authoritative provenance list.
+  // Legacy compatibility: migrate old plural fields into sources best-effort,
+  // then drop the redundant aggregates.
+  const legacyUrls = asArrayUniqueStrings(rec.urls || rec.url);
+  const legacySourcePages = asArrayUniqueStrings(rec.source_page_urls || rec.source_page_url);
+  const legacyLevels = asArrayUniqueNumbers(rec.levels);
+
+  rec.sources = Array.isArray(rec.sources) ? rec.sources : [];
+
+  // Remove any redundant saved_to fields inside sources (hash record already has canonical saved_to).
+  for (const s of rec.sources) {
+    if (s && typeof s === "object" && "saved_to" in s) delete s.saved_to;
+  }
+
+  if (rec.sources.length === 0 && (legacyUrls.length || legacySourcePages.length || legacyLevels.length)) {
+    const u0 = legacyUrls[0] || null;
+    const sp0 = legacySourcePages[0] || null;
+    if (legacyLevels.length) {
+      for (const lvl of legacyLevels) {
+        rec.sources.push({
+          url: u0,
+          source_page_url: sp0,
+          level: lvl,
+          ts: rec.first_seen_ts || rec.last_seen_ts || new Date().toISOString(),
+        });
+      }
+    } else if (u0 || sp0) {
+      rec.sources.push({
+        url: u0,
+        source_page_url: sp0,
+        level: null,
+        ts: rec.first_seen_ts || rec.last_seen_ts || new Date().toISOString(),
+      });
+    }
+  }
+
+  // Drop redundant aggregates; can be derived from sources.
+  delete rec.urls;
+  delete rec.url;
+  delete rec.source_page_urls;
+  delete rec.source_page_url;
+  delete rec.levels;
+  return rec;
+}
+
+function addSourceObservation(rec, obs) {
+  // obs: { url, source_page_url, level, ts }
+  if (!rec) return;
+  const key = `${obs.url}::${obs.source_page_url || ""}::${obs.level}`;
+  const seen = new Set((rec.sources||[]).map(s => `${s.url}::${s.source_page_url || ""}::${s.level}`));
+  if (!seen.has(key)) {
+    rec.sources.push({
+      url: obs.url,
+      source_page_url: obs.source_page_url || null,
+      level: obs.level,
+      ts: obs.ts
+    });
+  }
+}
+
+
 function manifestPath(cfg, level) {
   return path.join(cfg.LEVEL_FILES_DIR, `${String(level)}.json`);
 }
@@ -64,7 +157,7 @@ function makeUploadRouter(cfg) {
       return await withLock(() => {
       // Load global hash index (stores relative paths)
       const idx = readJsonSafe(cfg.DOWNLOADED_HASH_INDEX_PATH, {});
-      const existing = idx[sha256];
+      const existing = normalizeHashRec(idx[sha256]);
 
       // Resolve intended save path for THIS occurrence
       const route = resolveSavePath({
@@ -91,9 +184,8 @@ function makeUploadRouter(cfg) {
       if (existing?.saved_to) {
         const existingAbs = toAbsolute(existing.saved_to);
         if (fs.existsSync(existingAbs)) {
-          existing.levels = existing.levels || {};
-          existing.levels[String(bfs_level)] = true;
           existing.last_seen_ts = new Date().toISOString();
+          if (!existing.first_seen_ts) existing.first_seen_ts = existing.last_seen_ts;
 
           // If we can now route it into an electorate folder whereas it previously lived in term root,
           // upgrade location (more specific beats less specific).
@@ -129,6 +221,7 @@ function makeUploadRouter(cfg) {
             existing.note = note;
           }
 
+          addSourceObservation(existing, { url, source_page_url, level: bfs_level, ts: new Date().toISOString() });
           idx[sha256] = existing;
           writeJson(cfg.DOWNLOADED_HASH_INDEX_PATH, idx);
 
@@ -183,12 +276,19 @@ function makeUploadRouter(cfg) {
         ext: route.ext,
         termKey: route.termKey,
         electorateFolder: route.electorateFolder || null,
-        url,
-        source_page_url,
         last_seen_ts: new Date().toISOString(),
-        levels: { [String(bfs_level)]: true },
-        note,
+        first_seen_ts: new Date().toISOString(),
+        sources: [
+          {
+            url: String(url),
+            source_page_url: source_page_url ? String(source_page_url) : null,
+            level: Number(bfs_level),
+            ts: new Date().toISOString()
+          }
+        ],
+        note
       };
+      idx[sha256] = normalizeHashRec(idx[sha256]);
       writeJson(cfg.DOWNLOADED_HASH_INDEX_PATH, idx);
 
       appendToLevelManifest(cfg, bfs_level, { sha256, saved_to: outRel });

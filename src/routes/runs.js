@@ -11,12 +11,19 @@ function manifestPath(cfg, level) {
   return path.join(cfg.LEVEL_FILES_DIR, `${String(level)}.json`);
 }
 
-function minLevel(levelsObj) {
-  const ks = Object.keys(levelsObj || {})
-    .map(Number)
-    .filter((n) => Number.isFinite(n));
-  if (!ks.length) return Infinity;
-  return Math.min(...ks);
+function levelsFromSources(rec) {
+  const out = new Set();
+  for (const s of rec?.sources || []) {
+    const n = Number(s?.level);
+    if (Number.isFinite(n)) out.add(n);
+  }
+  return [...out].sort((a,b)=>a-b);
+}
+
+function minLevelFromSources(rec) {
+  const levels = levelsFromSources(rec);
+  if (!levels.length) return Infinity;
+  return Math.min(...levels);
 }
 
 function makeRunsRouter(cfg) {
@@ -32,8 +39,6 @@ function makeRunsRouter(cfg) {
       if (!Number.isFinite(level) || level < 1) {
         return res.status(400).json({ ok: false, error: "Invalid level" });
       }
-      const L = String(level);
-
       return await withLock(() => {
         ensureDir(cfg.LEVEL_FILES_DIR);
 
@@ -54,14 +59,15 @@ function makeRunsRouter(cfg) {
 
         const rec = sha ? idx[sha] : null;
 
-        // Remove this level's membership.
-        if (rec?.levels && rec.levels[L]) {
-          delete rec.levels[L];
-          removedLevelRefs++;
+        // Remove this level's membership by dropping matching source observations.
+        if (rec?.sources && Array.isArray(rec.sources)) {
+          const before = rec.sources.length;
+          rec.sources = rec.sources.filter((s) => Number(s?.level) !== level);
+          if (rec.sources.length !== before) removedLevelRefs += (before - rec.sources.length);
         }
 
         // Keep if any earlier level still references it.
-        const earlierMin = rec?.levels ? minLevel(rec.levels) : Infinity;
+        const earlierMin = rec ? minLevelFromSources(rec) : Infinity;
         const usedByEarlier = earlierMin < level;
         if (usedByEarlier) {
           keptBecauseEarlier++;
@@ -83,7 +89,8 @@ function makeRunsRouter(cfg) {
         }
 
         // If no remaining levels, drop the hash record.
-        if (rec && (!rec.levels || Object.keys(rec.levels).length === 0)) {
+        // If no remaining sources, drop the hash record.
+        if (rec && (!rec.sources || rec.sources.length === 0)) {
           delete idx[sha];
           deletedHashes++;
         } else if (rec) {

@@ -39,4 +39,22 @@ function writeFileArtifact({ path, files, level, metaFirstRow }) {
   return writeJson(path, [{ _meta: true, level, kind: "files", ...first }, ...rest]);
 }
 
-module.exports = { writeUrlArtifact, writeFileArtifact };
+/**
+ * Write a flat list of rows for Postman Runner (diffs, probes, etc).
+ * When metaFirstRow is true, the first array element is a conflated meta+row object.
+ */
+function writeRowListArtifact({ path, rows, kind, level, metaFirstRow, extraMeta }) {
+  if (!rows || rows.length === 0) return unlinkIfExists(path);
+
+  const ts = new Date().toISOString();
+
+  if (!metaFirstRow) {
+    return writeJson(path, rows.map((r) => ({ ...r, level, kind, ts, ...(extraMeta || {}) })));
+  }
+
+  const first = rows[0];
+  const rest = rows.slice(1);
+  return writeJson(path, [{ _meta: true, level, kind, ts, ...(extraMeta || {}), ...first }, ...rest]);
+}
+
+module.exports = { writeUrlArtifact, writeFileArtifact, writeRowListArtifact };

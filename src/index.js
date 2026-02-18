@@ -7,6 +7,7 @@ const { makeDedupeRouter } = require("./routes/dedupe");
 const { makeUploadRouter } = require("./routes/upload");
 const { makeElectoratesRouter } = require("./routes/electorates");
 const { makeRunsRouter } = require("./routes/runs");
+const { makeProbeRouter } = require("./routes/probe");
 
 // Ensure folders exist (same as old sink.js)
 ensureDir(cfg.BFS_ROOT);
@@ -24,6 +25,7 @@ app.use(makeDedupeRouter(cfg));
 app.use(makeUploadRouter(cfg));
 app.use(makeElectoratesRouter(cfg));
 app.use(makeRunsRouter(cfg));
+app.use(makeProbeRouter(cfg));
 
 app.listen(cfg.PORT, () => {
   console.log(`sink listening on http://localhost:${cfg.PORT}`);

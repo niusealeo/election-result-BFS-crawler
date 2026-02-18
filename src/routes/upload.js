@@ -10,7 +10,6 @@ const { sniffIsPdf, looksLikeHtml } = require("../lib/pdfguard");
 const { appendJsonl } = require("../lib/jsonl");
 const { toAbsolute, toRelative } = require("../lib/paths");
 const { withLock } = require("../lib/lock");
-const { loadUrlSigIndex, saveUrlSigIndex, getUrlSig, setUrlSig } = require("../lib/urlsig");
 
 function manifestPath(cfg, level) {
   return path.join(cfg.LEVEL_FILES_DIR, `${String(level)}.json`);
@@ -63,9 +62,6 @@ function makeUploadRouter(cfg) {
 
       // ---- Serialize RMW state updates (hash index + manifests) ----
       return await withLock(() => {
-      // Load per-URL signature index (tracks modifications at same URL)
-      const urlSigIdx = loadUrlSigIndex(cfg.URL_SIGNATURE_INDEX_PATH);
-      const prevUrlSig = getUrlSig(urlSigIdx, url);
       // Load global hash index (stores relative paths)
       const idx = readJsonSafe(cfg.DOWNLOADED_HASH_INDEX_PATH, {});
       const existing = idx[sha256];
@@ -152,40 +148,12 @@ function makeUploadRouter(cfg) {
             bfs_level,
           });
 
-          // Update per-URL signature index (same URL may map to same content)
-          setUrlSig(urlSigIdx, url, {
-            sha256,
-            bytes: buf.length,
-            saved_to: existing.saved_to,
-            last_seen_ts: new Date().toISOString(),
-            termKey: existing.termKey || route.termKey,
-            electorateFolder: existing.electorateFolder || route.electorateFolder || null,
-            ext: existing.ext || route.ext,
-            bfs_level,
-          });
-          saveUrlSigIndex(cfg.URL_SIGNATURE_INDEX_PATH, urlSigIdx);
-
-          const modified = !!(prevUrlSig && prevUrlSig.sha256 && prevUrlSig.sha256 !== sha256);
-          if (modified) {
-            appendJsonl(cfg.LOG_FILE_MODS, {
-              ts: new Date().toISOString(),
-              url,
-              bfs_level,
-              from_sha256: prevUrlSig.sha256,
-              to_sha256: sha256,
-              from_saved_to: prevUrlSig.saved_to || null,
-              to_saved_to: existing.saved_to,
-            });
-          }
-
           return res.json({
             ok: true,
             skipped: true,
             note: "duplicate_content_skipped",
             saved_to: existing.saved_to,
             sha256,
-            modified,
-            previous_sha256: prevUrlSig?.sha256 || null,
           });
         }
         // If record exists but file missing, fall through and re-save.
@@ -239,32 +207,6 @@ function makeUploadRouter(cfg) {
         bfs_level,
       });
 
-      // Update per-URL signature index and emit modification log if changed at same URL.
-      setUrlSig(urlSigIdx, url, {
-        sha256,
-        bytes: buf.length,
-        saved_to: outRel,
-        last_seen_ts: new Date().toISOString(),
-        termKey: route.termKey,
-        electorateFolder: route.electorateFolder || null,
-        ext: route.ext,
-        bfs_level,
-      });
-      saveUrlSigIndex(cfg.URL_SIGNATURE_INDEX_PATH, urlSigIdx);
-
-      const modified = !!(prevUrlSig && prevUrlSig.sha256 && prevUrlSig.sha256 !== sha256);
-      if (modified) {
-        appendJsonl(cfg.LOG_FILE_MODS, {
-          ts: new Date().toISOString(),
-          url,
-          bfs_level,
-          from_sha256: prevUrlSig.sha256,
-          to_sha256: sha256,
-          from_saved_to: prevUrlSig.saved_to || null,
-          to_saved_to: outRel,
-        });
-      }
-
       return res.json({
         ok: true,
         saved_to: outRel,
@@ -273,8 +215,6 @@ function makeUploadRouter(cfg) {
         electorateFolder: route.electorateFolder || null,
         note,
         sha256,
-        modified,
-        previous_sha256: prevUrlSig?.sha256 || null,
       });
       });
     } catch (e) {

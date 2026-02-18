@@ -1,0 +1,196 @@
+const fs = require("fs");
+const path = require("path");
+const os = require("os");
+
+
+const { resolveSavePath } = require("./routing");
+const { loadElectoratesMeta } = require("./electorates");
+const { ensureDir, readJsonSafe, writeJson } = require("./fsx");
+const { appendJsonl } = require("./jsonl");
+const { toAbsolute, toRelative } = require("./paths");
+
+function safeStat(absPath) {
+  try {
+    return fs.statSync(absPath);
+  } catch {
+    return null;
+  }
+}
+
+function ensureUniqueTarget(targetAbs, strategy) {
+  if (!fs.existsSync(targetAbs)) return targetAbs;
+  if (strategy === "overwrite") return targetAbs;
+  if (strategy === "skip") return null;
+  // default: suffix
+  const dir = path.dirname(targetAbs);
+  const ext = path.extname(targetAbs);
+  const base = path.basename(targetAbs, ext);
+  for (let i = 1; i < 1000; i++) {
+    const cand = path.join(dir, `${base}__dup${i}${ext}`);
+    if (!fs.existsSync(cand)) return cand;
+  }
+  return null;
+}
+
+function moveFile(oldAbs, newAbs, overwrite) {
+  ensureDir(path.dirname(newAbs));
+  if (overwrite && fs.existsSync(newAbs)) {
+    try { fs.unlinkSync(newAbs); } catch {}
+  }
+  try {
+    fs.renameSync(oldAbs, newAbs);
+  } catch {
+    fs.copyFileSync(oldAbs, newAbs);
+    try { fs.unlinkSync(oldAbs); } catch {}
+  }
+}
+
+function pickBestSource(sources) {
+  if (!Array.isArray(sources) || sources.length === 0) return null;
+  // Prefer most recent ts; else first
+  let best = sources[0];
+  let bestT = Date.parse(best?.ts || "");
+  for (const s of sources) {
+    const t = Date.parse(s?.ts || "");
+    if (Number.isFinite(t) && (Number.isNaN(bestT) || t > bestT)) {
+      best = s;
+      bestT = t;
+    }
+  }
+  return best;
+}
+
+function updateLevelManifests(cfg, oldRel, newRel, sha256) {
+  if (!fs.existsSync(cfg.LEVEL_FILES_DIR)) return;
+  const files = fs.readdirSync(cfg.LEVEL_FILES_DIR).filter((f) => f.endsWith(".json"));
+  for (const f of files) {
+    const p = path.join(cfg.LEVEL_FILES_DIR, f);
+    const m = readJsonSafe(p, null);
+    if (!m || !Array.isArray(m.files)) continue;
+    let changed = false;
+    for (const ent of m.files) {
+      if (!ent) continue;
+      if (sha256 && ent.sha256 !== sha256) continue;
+      if (ent.saved_to === oldRel) {
+        ent.saved_to = newRel;
+        changed = true;
+      }
+    }
+    if (changed) writeJson(p, m);
+  }
+}
+
+/**
+ * Resort already-downloaded files using routing.js.
+ *
+ * Uses downloaded_hash_index.json as the authoritative content list.
+ * For each hash record:
+ *  - compute desired path based on best source observation (url + source_page_url)
+ *  - preserve filename using filenameOverride = basename(existing.saved_to)
+ *  - move the canonical file if needed
+ *  - update saved_to / termKey / electorateFolder / ext
+ *  - update per-level manifests that point to old saved_to
+ */
+async function resortDownloads({ cfg, downloadsRootOverride, dryRun = true, conflict = "suffix", limit = null }) {
+  const downloadsRoot = downloadsRootOverride ? path.resolve(downloadsRootOverride) : cfg.DOWNLOADS_ROOT;
+  ensureDir(downloadsRoot);
+
+  const electoratesByTerm = loadElectoratesMeta(cfg.ELECTORATES_BY_TERM_PATH);
+  const idx = readJsonSafe(cfg.DOWNLOADED_HASH_INDEX_PATH, {});
+
+  const actions = [];
+  let processed = 0;
+
+  for (const [sha256, rec] of Object.entries(idx)) {
+    if (limit && processed >= limit) break;
+    processed++;
+
+    if (!rec || typeof rec !== "object") continue;
+    const oldRel = rec.saved_to;
+    if (!oldRel) continue;
+    const oldAbs = toAbsolute(oldRel);
+    const st = safeStat(oldAbs);
+    if (!st || !st.isFile()) {
+      actions.push({ action: "missing", sha256, saved_to: oldRel });
+      continue;
+    }
+
+    const src = pickBestSource(rec.sources);
+    if (!src?.url) {
+      actions.push({ action: "no_source", sha256, saved_to: oldRel });
+      continue;
+    }
+
+    const filenameOverride = path.basename(oldRel);
+    const route = resolveSavePath({
+      downloadsRoot,
+      url: src.url,
+      ext: rec.ext || null,
+      source_page_url: src.source_page_url || null,
+      electoratesByTerm,
+      filenameOverride,
+    });
+
+    const newAbsDesired = route.outPath;
+    const newRelDesired = toRelative(newAbsDesired);
+
+    const samePath = path.resolve(oldAbs) === path.resolve(newAbsDesired);
+    if (samePath) {
+      rec.termKey = route.termKey;
+      rec.electorateFolder = route.electorateFolder || null;
+      rec.ext = route.ext;
+      continue;
+    }
+
+    const overwrite = conflict === "overwrite";
+    const targetAbs = ensureUniqueTarget(newAbsDesired, conflict);
+    if (!targetAbs) {
+      actions.push({ action: "conflict_skip", sha256, from: oldRel, to: newRelDesired, strategy: conflict });
+      continue;
+    }
+
+    const targetRel = toRelative(targetAbs);
+    actions.push({
+      action: dryRun ? "would_move" : "move",
+      sha256,
+      from: oldRel,
+      to: targetRel,
+      termKey: route.termKey,
+      electorateFolder: route.electorateFolder || null,
+    });
+
+    // Print planned moves in dry-run (and also in apply mode, for traceability)
+const hashShort = String(sha256 || "").slice(0, 8);
+const tag = dryRun ? "[DRY]" : "[MOVE]";
+console.log(`${tag} MOVE ${hashShort}… ${oldRel}${os.EOL}           -> ${targetRel}`);
+
+    if (!dryRun) {
+      moveFile(oldAbs, targetAbs, overwrite);
+      rec.saved_to = targetRel;
+      rec.termKey = route.termKey;
+      rec.electorateFolder = route.electorateFolder || null;
+      rec.ext = route.ext;
+      rec.last_seen_ts = new Date().toISOString();
+      if (!rec.first_seen_ts) rec.first_seen_ts = rec.last_seen_ts;
+      updateLevelManifests(cfg, oldRel, targetRel, sha256);
+    }
+  }
+
+  if (!dryRun) {
+    writeJson(cfg.DOWNLOADED_HASH_INDEX_PATH, idx);
+  }
+
+  for (const a of actions) {
+    appendJsonl(cfg.LOG_FILE_SAVES, { kind: "resort", dryRun, ...a, ts: new Date().toISOString() });
+  }
+
+  const moved = actions.filter((x) => x.action === "move").length;
+  const would = actions.filter((x) => x.action === "would_move").length;
+  const missing = actions.filter((x) => x.action === "missing").length;
+  const conflictSkips = actions.filter((x) => x.action === "conflict_skip").length;
+
+  console.log(`resort-downloads: processed=${processed} dryRun=${dryRun} conflict=${conflict}`);
+  console.log(`  would_move=${would} moved=${moved} missing=${missing} conflict_skip=${conflictSkips}`);
+}
+
+module.exports = { resortDownloads };

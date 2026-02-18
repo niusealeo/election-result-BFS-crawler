@@ -115,7 +115,11 @@ function termKeyForEvent(eventYear, monthOpt, electoratesByTerm) {
   if (!Number.isFinite(eventYear)) return "term_unknown";
 
   const base = inferTermKeyFromEventYear(eventYear, electoratesByTerm) || `term_extra_(${eventYear})`;
-  if (!monthOpt || !Number.isFinite(monthOpt)) return base;
+  // If we can't parse a month, we still attempt a best-effort correction for
+  // state-change events that occur in a GE year (e.g. 2017 by-elections that are
+  // almost always *pre*-GE). This avoids misrouting into the *new* term when the
+  // only signal available is the year in the URL path.
+  const hasMonth = monthOpt && Number.isFinite(monthOpt);
 
   const terms = Object.keys(electoratesByTerm || {})
     .map((k) => ({ k, p: termKeyParts(k) }))
@@ -124,7 +128,15 @@ function termKeyForEvent(eventYear, monthOpt, electoratesByTerm) {
 
   // Only apply early-year override when this year is a known GE year in the scraped list.
   const idx = terms.findIndex((t) => t.p.geYear === eventYear);
-  if (idx > 0 && monthOpt <= 6) return terms[idx - 1].k;
+  if (idx > 0) {
+    // If month known: only flip for Jan–Jun.
+    if (hasMonth && monthOpt <= 6) return terms[idx - 1].k;
+
+    // If month unknown: prefer prior term (conservative for by-elections/referenda).
+    // Rationale: these pages are typically organized by the Parliament/term the event
+    // occurred *during*, and GE-year events overwhelmingly happen before the GE.
+    if (!hasMonth) return terms[idx - 1].k;
+  }
 
   return base;
 }

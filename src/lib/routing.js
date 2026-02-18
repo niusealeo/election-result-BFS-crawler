@@ -323,14 +323,12 @@ function resolveSavePath({ downloadsRoot, url, ext, source_page_url, electorates
     (sourceUrl ? parseMonthFromNameOrUrl(sourceUrl) : null) ||
     parseMonthFromNameOrUrl(fileUrl);
 
-    // Prefer /YYYY_ prefix (underscore breaks \b word-boundary matching)
+  // Prefer /YYYY_ prefix (underscore breaks \b word-boundary matching)
   let yearMatch = fileUrl.match(/\/(19\d{2}|20\d{2})_/);
-
-  // fallback: a standalone 4-digit year anywhere (covers other patterns)
+  // Fallback: a 4-digit year not embedded in a longer number
   if (!yearMatch) {
     yearMatch = fileUrl.match(/(?:^|[^0-9])(19\d{2}|20\d{2})(?!\d)/);
   }
-
   const eventYear = yearMatch ? Number(yearMatch[1]) : NaN;
 
   let termKey = isStateChange

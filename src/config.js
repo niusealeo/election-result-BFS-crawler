@@ -19,11 +19,16 @@ const ELECTORATES_BY_TERM_PATH = path.join(META_DIR, "electorates_by_term.json")
 // Content-hash index for downloaded files (stores relative paths)
 const DOWNLOADED_HASH_INDEX_PATH = path.join(META_DIR, "downloaded_hash_index.json");
 
+// Per-URL signature index (tracks latest observed content signature for a URL)
+// Used for detecting same-URL content changes across update runs.
+const URL_SIGNATURE_INDEX_PATH = path.join(META_DIR, "url_signature_index.json");
+
 // Logs
 const LOG_DEDUPE = path.join(RUNS_DIR, "dedupe_log.jsonl");
 const LOG_FILE_SAVES = path.join(RUNS_DIR, "file_saves.jsonl");
 const LOG_ELECTORATES_INGEST = path.join(RUNS_DIR, "electorates_ingest.jsonl");
 const LOG_LEVEL_RESETS = path.join(RUNS_DIR, "level_resets.jsonl");
+const LOG_FILE_MODS = path.join(RUNS_DIR, "file_mods.jsonl");
 
 // Artifact output format: put conflated meta row first
 // true => first row is {_meta:true, level, kind, ...real row...}, remaining rows minimal
@@ -41,8 +46,10 @@ module.exports = {
   STATE_PATH,
   ELECTORATES_BY_TERM_PATH,
   DOWNLOADED_HASH_INDEX_PATH,
+  URL_SIGNATURE_INDEX_PATH,
   LOG_DEDUPE,
   LOG_FILE_SAVES,
+  LOG_FILE_MODS,
   LOG_ELECTORATES_INGEST,
   LOG_LEVEL_RESETS,
   ARTIFACT_META_FIRST_ROW,

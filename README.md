@@ -129,7 +129,7 @@ npm install
 Start the sink server (the HTTP endpoint Postman will call):
 
 ```bash
-npm run start
+npm start
 ```
 
 Watch console output for the listening port (commonly `http://localhost:3030` or similar).

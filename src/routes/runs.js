@@ -10,7 +10,7 @@ const { cfgForReq, domainCfg, ensureDomainFolders } = require("../lib/domain");
 const { stableUniqUrls, extFromUrl } = require("../lib/urlnorm");
 const { mergeFilesPreferSource } = require("../lib/dedupe");
 const { loadState, saveState, computeSeenUpTo } = require("../lib/state");
-const { writeUrlArtifact, writeFileArtifact } = require("../lib/artifacts");
+const { writeUrlArtifact, writeFileArtifact, writeUrlsForLevel, writeChunkedUrls } = require("../lib/artifacts");
 
 const readline = require("readline");
 
@@ -39,6 +39,16 @@ function safeRunId(v) {
 function runJsonlPath(cfg, level, runId) {
   ensureDir(cfg.RUNS_DIR);
   return path.join(cfg.RUNS_DIR, `discover_level_${String(level)}_${safeRunId(runId)}.jsonl`);
+}
+
+function runDoneMarkerPath(jsonlPath) {
+  return `${jsonlPath}.done`;
+}
+
+function markRunDone(jsonlPath, payload) {
+  try {
+    fs.writeFileSync(runDoneMarkerPath(jsonlPath), JSON.stringify({ ts: new Date().toISOString(), ...(payload || {}) }, null, 2), { encoding: "utf-8" });
+  } catch {}
 }
 
 // When Postman streams a run, the first call (/runs/start/urls) may not include any URL
@@ -113,6 +123,120 @@ async function readDiscoveryJsonl(p) {
   return { visited, pages, files };
 }
 
+// Finalize helper used by both HTTP endpoint and the auto-finalize watchdog.
+// IMPORTANT: Caller should hold withLock() if needed.
+async function finalizeDiscoveryRun({ baseCfg, cfg, level, run_id, jsonlPath }) {
+  ensureDomainFolders(cfg);
+
+  const p = jsonlPath || runJsonlPath(cfg, level, run_id);
+  const acc = await readDiscoveryJsonl(p);
+  const visited = stableUniqUrls(Array.from(acc.visited));
+  const pages = stableUniqUrls(Array.from(acc.pages));
+
+  const inFiles = Array.from(acc.files.values());
+  const filesMerged = mergeFilesPreferSource(inFiles);
+
+  const st = loadState(cfg.STATE_PATH);
+  st.levels[String(level)] = { visited, pages, files: filesMerged };
+  saveState(cfg.STATE_PATH, st);
+
+  const { seenPages: seenPagesBefore, seenFiles: seenFilesBefore } = computeSeenUpTo(st, level - 1);
+  const seenForNextPages = new Set([...seenPagesBefore, ...visited]);
+
+  const nextPages = pages.filter((u) => !seenForNextPages.has(u));
+  const filesOut = filesMerged.filter((f) => !seenFilesBefore.has(f.url));
+
+  const filesForArtifact = filesOut.map((f) => ({
+    url: f.url,
+    ext: (f.ext || extFromUrl(f.url) || "bin").toLowerCase(),
+    source_page_url: f.source_page_url || null,
+  }));
+
+  const nextLevel = level + 1;
+  const nextUrlsPath = path.join(cfg.ARTIFACT_DIR, `urls-level-${nextLevel}.json`);
+  const filesPath = path.join(cfg.ARTIFACT_DIR, `files-level-${level}.json`);
+
+  writeUrlArtifact({ path: nextUrlsPath, urls: nextPages, nextLevel, metaFirstRow: cfg.ARTIFACT_META_FIRST_ROW });
+  writeFileArtifact({ path: filesPath, files: filesForArtifact, level, metaFirstRow: cfg.ARTIFACT_META_FIRST_ROW });
+
+  // -------------------------------------------------------------------
+  // Resumable + chunked artifacts
+  // -------------------------------------------------------------------
+  // 1) Chunk the *next level* urls output so the user can feed Postman in
+  //    smaller runs without crashing.
+  const chunkSize = Number(baseCfg.ARTIFACT_CHUNK_SIZE || 6169);
+  const nextChunkInfo = writeChunkedUrls({
+    basePath: nextUrlsPath,
+    urls: nextPages,
+    level: nextLevel,
+    metaFirstRow: cfg.ARTIFACT_META_FIRST_ROW,
+    chunkSize,
+  });
+
+  // 2) Produce a remaining list for the *current level* so a crash can be
+  //    resumed by crawling only what was not visited.
+  //    Prefer the input artifact for this level if present.
+  let inputUrls = [];
+  try {
+    const inPath = path.join(cfg.ARTIFACT_DIR, `urls-level-${level}.json`);
+    const arr = readJsonSafe(inPath, []);
+    if (Array.isArray(arr)) {
+      inputUrls = arr.map((r) => (typeof r === "string" ? r : r?.url)).filter(Boolean);
+    }
+  } catch {}
+
+  // If input artifact isn't available (rare), we can still create remaining
+  // by treating the discovered 'visited' set as the whole input.
+  const visitedSet = new Set(visited);
+  const remaining = (inputUrls && inputUrls.length)
+    ? stableUniqUrls(inputUrls).filter((u) => !visitedSet.has(u))
+    : [];
+
+  const remainingPath = path.join(cfg.ARTIFACT_DIR, `urls-level-${level}.remaining.json`);
+  writeUrlsForLevel({ path: remainingPath, urls: remaining, level, metaFirstRow: cfg.ARTIFACT_META_FIRST_ROW });
+  const remainingChunkInfo = writeChunkedUrls({
+    basePath: remainingPath,
+    urls: remaining,
+    level,
+    metaFirstRow: cfg.ARTIFACT_META_FIRST_ROW,
+    chunkSize,
+  });
+
+  appendJsonl(cfg.LOG_DEDUPE, {
+    ts: new Date().toISOString(),
+    level,
+    run_id,
+    mode: "streaming",
+    visited: visited.length,
+    pages: pages.length,
+    next_pages: nextPages.length,
+    files_in: inFiles.length,
+    files_out: filesForArtifact.length,
+  });
+
+  markRunDone(p, { level, run_id, domain_key: cfg.domain_key, wrote: { next_urls: nextUrlsPath, files: filesPath } });
+
+  return {
+    ok: true,
+    level,
+    run_id,
+    visited: visited.length,
+    pages: pages.length,
+    next_pages: nextPages.length,
+    files: filesForArtifact.length,
+    remaining: remaining.length,
+    wrote: {
+      next_urls: nextUrlsPath,
+      next_urls_parts: nextChunkInfo.chunk_files,
+      next_urls_parts_manifest: nextChunkInfo.manifest_path,
+      files: filesPath,
+      remaining_urls: remainingPath,
+      remaining_urls_parts: remainingChunkInfo.chunk_files,
+      remaining_urls_parts_manifest: remainingChunkInfo.manifest_path,
+    },
+  };
+}
+
 function manifestPath(cfg, level) {
   return path.join(cfg.LEVEL_FILES_DIR, `${String(level)}.json`);
 }
@@ -155,6 +279,8 @@ function makeRunsRouter(baseCfg) {
         ensureDir(path.dirname(p));
         // Hard reset: overwrite file
         fs.writeFileSync(p, "", { encoding: "utf-8" });
+        // Clear any prior done marker for this run bucket.
+        try { if (fs.existsSync(runDoneMarkerPath(p))) fs.unlinkSync(runDoneMarkerPath(p)); } catch {}
         appendJsonl(cfg.LOG_LEVEL_RESETS, {
           ts: new Date().toISOString(),
           kind: "urls",
@@ -250,59 +376,31 @@ function makeRunsRouter(baseCfg) {
           if (found?.path && fs.existsSync(found.path)) p = found.path;
         }
 
-        const acc = await readDiscoveryJsonl(p);
-        const visited = stableUniqUrls(Array.from(acc.visited));
-        const pages = stableUniqUrls(Array.from(acc.pages));
-
-        const inFiles = Array.from(acc.files.values());
-        const filesMerged = mergeFilesPreferSource(inFiles);
-
-        const st = loadState(cfg.STATE_PATH);
-        st.levels[String(level)] = { visited, pages, files: filesMerged };
-        saveState(cfg.STATE_PATH, st);
-
-        const { seenPages: seenPagesBefore, seenFiles: seenFilesBefore } = computeSeenUpTo(st, level - 1);
-        const seenForNextPages = new Set([...seenPagesBefore, ...visited]);
-
-        const nextPages = pages.filter((u) => !seenForNextPages.has(u));
-        const filesOut = filesMerged.filter((f) => !seenFilesBefore.has(f.url));
-
-        const filesForArtifact = filesOut.map((f) => ({
-          url: f.url,
-          ext: (f.ext || extFromUrl(f.url) || "bin").toLowerCase(),
-          source_page_url: f.source_page_url || null,
-        }));
-
-        const nextLevel = level + 1;
-        const nextUrlsPath = path.join(cfg.ARTIFACT_DIR, `urls-level-${nextLevel}.json`);
-        const filesPath = path.join(cfg.ARTIFACT_DIR, `files-level-${level}.json`);
-
-        writeUrlArtifact({ path: nextUrlsPath, urls: nextPages, nextLevel, metaFirstRow: cfg.ARTIFACT_META_FIRST_ROW });
-        writeFileArtifact({ path: filesPath, files: filesForArtifact, level, metaFirstRow: cfg.ARTIFACT_META_FIRST_ROW });
-
-        appendJsonl(cfg.LOG_DEDUPE, {
-          ts: new Date().toISOString(),
-          level,
-          run_id,
-          mode: "streaming",
-          visited: visited.length,
-          pages: pages.length,
-          next_pages: nextPages.length,
-          files_in: inFiles.length,
-          files_out: filesForArtifact.length,
-        });
-
-        return res.json({
-          ok: true,
-          level,
-          run_id,
-          visited: visited.length,
-          pages: pages.length,
-          next_pages: nextPages.length,
-          files: filesForArtifact.length,
-          wrote: { next_urls: nextUrlsPath, files: filesPath },
-        });
+        const result = await finalizeDiscoveryRun({ baseCfg, cfg, level, run_id, jsonlPath: p });
+        return res.json(result);
       });
+    } catch (e) {
+      return res.status(500).json({ ok: false, error: String(e?.message || e) });
+    }
+  });
+
+  // Utility: chunk an existing urls-level-N.json (or any compatible list) into
+  // smaller parts so Postman can run it without crashing.
+  // Body: { level, chunk_size? }
+  // Writes: urls-level-N.json (unchanged), plus urls-level-N.json.part-....json and manifest.
+  r.post("/runs/chunk/urls", async (req, res) => {
+    try {
+      const cfg = cfgForReq(baseCfg, req);
+      const level = Number(req.body?.level);
+      if (!Number.isFinite(level) || level < 1) {
+        return res.status(400).json({ ok: false, error: "Invalid level" });
+      }
+      const chunkSize = Number(req.body?.chunk_size || baseCfg.ARTIFACT_CHUNK_SIZE || 6169);
+      const inPath = path.join(cfg.ARTIFACT_DIR, `urls-level-${level}.json`);
+      const arr = readJsonSafe(inPath, []);
+      const urls = Array.isArray(arr) ? arr.map((r) => (typeof r === "string" ? r : r?.url)).filter(Boolean) : [];
+      const info = writeChunkedUrls({ basePath: inPath, urls: stableUniqUrls(urls), level, metaFirstRow: cfg.ARTIFACT_META_FIRST_ROW, chunkSize });
+      return res.json({ ok: true, level, chunk_size: chunkSize, total: urls.length, wrote: info });
     } catch (e) {
       return res.status(500).json({ ok: false, error: String(e?.message || e) });
     }
@@ -411,4 +509,4 @@ function makeRunsRouter(baseCfg) {
   return r;
 }
 
-module.exports = { makeRunsRouter };
+module.exports = { makeRunsRouter, finalizeDiscoveryRun };

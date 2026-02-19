@@ -7,9 +7,10 @@ const { makeHealthRouter } = require("./routes/health");
 const { makeDedupeRouter } = require("./routes/dedupe");
 const { makeUploadRouter } = require("./routes/upload");
 const { makeElectoratesRouter } = require("./routes/electorates");
-const { makeRunsRouter } = require("./routes/runs");
+const { makeRunsRouter, finalizeDiscoveryRun } = require("./routes/runs");
 const { makeProbeRouter } = require("./routes/probe");
 const { resortDownloads } = require("./lib/resort");
+const { startAutoFinalize } = require("./lib/autofinalize");
 
 function ensureFolders() {
   // Ensure root folders exist (domain-scoped subfolders are created on demand)
@@ -47,6 +48,11 @@ async function runServer() {
   app.use(makeElectoratesRouter(baseCfg));
   app.use(makeRunsRouter(baseCfg));
   app.use(makeProbeRouter(baseCfg));
+
+  // Auto-finalize stale streaming runs (helps when Postman crashes on 10k+ iterations).
+  startAutoFinalize({ baseCfg, finalizeDiscoveryRun }).catch((e) => {
+    console.log(`[auto-finalize] failed to start: ${String(e?.message || e)}`);
+  });
 
   app.listen(baseCfg.PORT, () => {
     console.log(`sink listening on http://localhost:${baseCfg.PORT}`);

@@ -182,6 +182,13 @@ Postman fetches pages (GET) and extracts links (href/src/etc) and emits URL rows
 - **Legacy (single-batch):** accumulates discoveries inside Postman and calls `POST /dedupe/level` once at the end of the run. Good for small/medium levels.
 - **Streaming (large-run):** sends discoveries to sink in chunks using `POST /runs/start/urls`, `POST /runs/append/urls`, then `POST /runs/finalize/urls`. This avoids Postman memory limits on 10k+ URL levels.
 
+**Auto-finalize (crash recovery):** Postman can still crash on very large runs due to UI/response retention. In streaming mode the sink writes discoveries to a JSONL run bucket as it goes. If the explicit finalize call never happens, the sink will automatically finalize any run bucket that has been idle for a while (no new appends), producing the usual `urls-level-(L+1).json` and `files-level-L.json` artifacts.
+
+Environment variables:
+- `AUTO_FINALIZE_ENABLED=1` (default). Set to `0` to disable.
+- `AUTO_FINALIZE_IDLE_MS=180000` (default 3 minutes).
+- `AUTO_FINALIZE_INTERVAL_MS=60000` (default 1 minute).
+
 This repo ships both Postman collection files so you can choose per run:
 - `NZ Elections.postman_collection.legacy.json`
 - `NZ Elections.postman_collection.streaming.json` (also copied as `NZ Elections.postman_collection.json`)

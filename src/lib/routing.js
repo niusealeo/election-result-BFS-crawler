@@ -328,14 +328,6 @@ function resolveSavePath({ downloadsRoot, url, ext, source_page_url, electorates
   const isReferendum = /(referenda?|referendum)/i.test(fileUrl) || (sourceUrl ? /(referenda?|referendum)/i.test(sourceUrl) : false);
   const isStateChange = isByElection || isReferendum;
 
-  // Targeted exception: 2017 Mt Albert by-election was pre-GE 2017 (no month in URLs).
-  // Keep it in term 51 even though year is a GE year.
-  const isBeforeGE =
-    isByElection && (/\/2017_mt_albert_byelection\//i.test(fileUrl) || /\/2011_te_tai_tokerau_byelection\//i.test(fileUrl) || /\/2011_botany_byelection\//i.test(fileUrl));
-
-  // (You can add similar targeted exceptions here if needed.)
-
-
   // Parse month for early-year override (e.g. Feb 2017 should be prior term)
   const fnameForDate = filenameOverride ? String(filenameOverride) : filenameFromUrl(fileUrl);
   const monthOpt =
@@ -348,7 +340,26 @@ function resolveSavePath({ downloadsRoot, url, ext, source_page_url, electorates
   const yearMatch = fileUrl.match(/(?:^|[^0-9])(19\d{2}|20\d{2})(?=[^0-9]|$)/);
   const eventYear = yearMatch ? Number(yearMatch[1]) : NaN;
 
+  // Targeted exception: 2017 Mt Albert by-election was pre-GE 2017 (no month in URLs).
+  // Keep it in term 51 even though year is a GE year.
+  const forcedPreGEYears = new Set([
+    2017,
+    2011
+  ]);
   // (You can add similar targeted exceptions here if needed.)
+  const forcedPreGESlugs = [
+    "mt_albert_byelection",
+    "te_tai_tokerau_byelection",
+    "botany_byelection"
+  ];
+
+  const isBeforeGE =
+    isByElection &&
+    forcedPreGEYears.has(eventYear) &&
+    forcedPreGESlugs.some(slug =>
+      new RegExp(`/${eventYear}_${slug}/`, "i").test(fileUrl)
+    );
+
   let termKey = isStateChange
     ? (isBeforeGE
       ? termKeyForEvent(eventYear, 6, electoratesByTerm)

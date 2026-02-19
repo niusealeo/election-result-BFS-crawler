@@ -6,6 +6,7 @@ const { ensureDir, readJsonSafe, writeJson } = require("../lib/fsx");
 const { appendJsonl } = require("../lib/jsonl");
 const { toAbsolute } = require("../lib/paths");
 const { withLock } = require("../lib/lock");
+const { cfgForReq } = require("../lib/domain");
 
 function manifestPath(cfg, level) {
   return path.join(cfg.LEVEL_FILES_DIR, `${String(level)}.json`);
@@ -26,7 +27,7 @@ function minLevelFromSources(rec) {
   return Math.min(...levels);
 }
 
-function makeRunsRouter(cfg) {
+function makeRunsRouter(baseCfg) {
   const r = express.Router();
 
   // Hard reset for a BFS file-download level, BUT keep any file also used
@@ -35,6 +36,7 @@ function makeRunsRouter(cfg) {
   // Body: { level: number }
   r.post("/runs/start/files", async (req, res) => {
     try {
+      const cfg = cfgForReq(baseCfg, req);
       const level = Number(req.body?.level);
       if (!Number.isFinite(level) || level < 1) {
         return res.status(400).json({ ok: false, error: "Invalid level" });

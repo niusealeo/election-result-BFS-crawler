@@ -4,6 +4,7 @@ const path = require("path");
 const { ensureDir, readJsonSafe, writeJson } = require("../lib/fsx");
 const { appendJsonl } = require("../lib/jsonl");
 const { writeRowListArtifact } = require("../lib/artifacts");
+const { cfgForReq } = require("../lib/domain");
 
 function inferExtFromUrl(url) {
   try {
@@ -78,7 +79,7 @@ function resolveField(row, row0, key) {
   return null;
 }
 
-function makeProbeRouter(cfg) {
+function makeProbeRouter(baseCfg) {
   const r = express.Router();
 
   // POST /probe/meta
@@ -95,6 +96,7 @@ function makeProbeRouter(cfg) {
   //  - emits files-meta-diff-level-L.json when a change is detected (for Postman Runner)
   r.post("/probe/meta", (req, res) => {
     try {
+      const cfg = cfgForReq(baseCfg, req);
       const body = req.body || {};
       const url = body.url ? String(body.url) : null;
       const level = body.level != null && body.level !== "" ? Number(body.level) : null;

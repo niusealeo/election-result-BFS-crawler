@@ -6,6 +6,7 @@ const { mergeFilesPreferSource } = require("../lib/dedupe");
 const { loadState, saveState, computeSeenUpTo } = require("../lib/state");
 const { appendJsonl } = require("../lib/jsonl");
 const { writeUrlArtifact, writeFileArtifact, writeRowListArtifact } = require("../lib/artifacts");
+const { cfgForReq } = require("../lib/domain");
 
 function readUrlArtifactList(p) {
   const raw = readJsonSafe(p, null);
@@ -41,11 +42,12 @@ function diffByUrl(oldArr, newArr) {
   return { added, removed };
 }
 
-function makeDedupeRouter(cfg) {
+function makeDedupeRouter(baseCfg) {
   const r = express.Router();
 
   r.post("/dedupe/level", (req, res) => {
     try {
+      const cfg = cfgForReq(baseCfg, req);
       const level = Number(req.body?.level);
       if (!Number.isFinite(level) || level < 1) {
         return res.status(400).json({ ok: false, error: "Invalid level" });

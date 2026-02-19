@@ -1,6 +1,7 @@
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
+const crypto = require("crypto");
 
 const { resolveSavePath } = require("./routing");
 const { loadElectoratesMeta } = require("./electorates");
@@ -16,12 +17,16 @@ function safeStat(absPath) {
   }
 }
 
-function ensureUniqueTarget(targetAbs, strategy) {
-  if (!fs.existsSync(targetAbs)) return targetAbs;
-  if (strategy === "overwrite") return targetAbs;
-  if (strategy === "skip") return null;
+function sha256File(absPath) {
+  // Files are typically not huge here (xls/csv/pdf). Sync is fine for CLI.
+  const h = crypto.createHash("sha256");
+  const buf = fs.readFileSync(absPath);
+  h.update(buf);
+  return h.digest("hex");
+}
 
-  // default: suffix
+function ensureUniqueTarget(targetAbs) {
+  // Always suffix in-place with __dupN.
   const dir = path.dirname(targetAbs);
   const ext = path.extname(targetAbs);
   const base = path.basename(targetAbs, ext);
@@ -32,20 +37,16 @@ function ensureUniqueTarget(targetAbs, strategy) {
   return null;
 }
 
-function moveFile(oldAbs, newAbs, overwrite) {
+function moveFile(oldAbs, newAbs, overwrite = false) {
   ensureDir(path.dirname(newAbs));
   if (overwrite && fs.existsSync(newAbs)) {
-    try {
-      fs.unlinkSync(newAbs);
-    } catch {}
+    try { fs.unlinkSync(newAbs); } catch {}
   }
   try {
     fs.renameSync(oldAbs, newAbs);
   } catch {
     fs.copyFileSync(oldAbs, newAbs);
-    try {
-      fs.unlinkSync(oldAbs);
-    } catch {}
+    try { fs.unlinkSync(oldAbs); } catch {}
   }
 }
 
@@ -87,13 +88,15 @@ function updateLevelManifests(cfg, oldRel, newRel, sha256) {
 /**
  * Resort already-downloaded files using routing.js.
  *
- * Uses downloaded_hash_index.json as the authoritative content list.
- * For each hash record:
- *  - compute desired path based on best source observation (url + source_page_url)
- *  - preserve filename using filenameOverride = basename(existing.saved_to)
- *  - move the canonical file if needed
- *  - update saved_to / termKey / electorateFolder / ext
- *  - update per-level manifests that point to old saved_to
+ * Authoritative input: downloaded_hash_index.json (per domain).
+ *
+ * Behaviours:
+ *  - Move/rename indexed files into their routed canonical location.
+ *  - If canonical target is occupied:
+ *      * same sha => dedupe (adopt canonical path).
+ *      * different sha:
+ *          - if occupant sha is NOT in index: displace occupant to __dupN, then place indexed file.
+ *          - if occupant sha IS in index: do not overwrite; suffix this file to __dupN (twin).
  */
 async function resortDownloads({ cfg, downloadsRootOverride, dryRun = true, conflict = "suffix", limit = null }) {
   const downloadsRoot = downloadsRootOverride ? path.resolve(downloadsRootOverride) : cfg.DOWNLOADS_ROOT;
@@ -102,16 +105,21 @@ async function resortDownloads({ cfg, downloadsRootOverride, dryRun = true, conf
   const electoratesByTerm = loadElectoratesMeta(cfg.ELECTORATES_BY_TERM_PATH);
   const idx = readJsonSafe(cfg.DOWNLOADED_HASH_INDEX_PATH, {});
 
-  // Reverse index: saved_to (relative) -> sha256
-  // Used to identify who "owns" a path.
-  const savedToSha = new Map();
-  for (const [h, r] of Object.entries(idx)) {
-    const p = r && typeof r === "object" ? r.saved_to : null;
-    if (p) savedToSha.set(p, h);
-  }
-
   const actions = [];
   let processed = 0;
+
+  // Counters for sanity
+  let wouldMove = 0;
+  let moved = 0;
+  let missing = 0;
+  let conflictSkip = 0;
+  let wouldDedupe = 0;
+  let deduped = 0;
+  let wouldDup = 0;
+  let duped = 0;
+  let wouldDisplace = 0;
+  let displaced = 0;
+  let diskHashFailed = 0;
 
   for (const [sha256, rec] of Object.entries(idx)) {
     if (limit && processed >= limit) break;
@@ -120,9 +128,11 @@ async function resortDownloads({ cfg, downloadsRootOverride, dryRun = true, conf
     if (!rec || typeof rec !== "object") continue;
     const oldRel = rec.saved_to;
     if (!oldRel) continue;
+
     const oldAbs = toAbsolute(oldRel);
     const st = safeStat(oldAbs);
     if (!st || !st.isFile()) {
+      missing++;
       actions.push({ action: "missing", sha256, saved_to: oldRel });
       continue;
     }
@@ -143,199 +153,124 @@ async function resortDownloads({ cfg, downloadsRootOverride, dryRun = true, conf
       filenameOverride,
     });
 
-    const newAbsDesired = route.outPath;
-    const newRelDesired = toRelative(newAbsDesired);
+    const desiredAbs = route.outPath;
+    const desiredRel = toRelative(desiredAbs);
+    const samePath = path.resolve(oldAbs) === path.resolve(desiredAbs);
 
-    const samePath = path.resolve(oldAbs) === path.resolve(newAbsDesired);
-    if (samePath) {
-      rec.termKey = route.termKey;
-      rec.electorateFolder = route.electorateFolder || null;
-      rec.ext = route.ext;
-      continue;
-    }
+    // Always refresh routing metadata even if no move.
+    rec.termKey = route.termKey;
+    rec.electorateFolder = route.electorateFolder || null;
+    rec.ext = route.ext;
 
-    // If the desired target is already occupied, decide whether we should:
-    // - DEDUPE (same content), or
-    // - DISPLACE the occupant (when the incoming file is the indexed/canonical one), or
-    // - SUFFIX the incoming file (when the occupant should keep the canonical name).
-    //
-    // Key rule for your workflow:
-    //   If the incoming file's SHA256 is in downloaded_hash_index.json, it is canonical content.
-    //   If the occupant is not indexed (or is indexed but "misplaced"), rename the occupant to __dupN
-    //   and let the canonical file take the routed canonical filename.
-    let forceTargetAbs = null;
-
-    if (fs.existsSync(newAbsDesired)) {
-      const existingRel = newRelDesired;               // toRelative(newAbsDesired)
-      const existingAbs = newAbsDesired;
-      const existingSha = savedToSha.get(existingRel); // who already "owns" this path?
-      let diskSha = null;
-
-      if (!existingSha) {
-        // Target exists but not in index — hash it directly so we can see if it's indexed content.
-        try {
-          const crypto = require("crypto");
-          const data = fs.readFileSync(existingAbs);
-          diskSha = crypto.createHash("sha256").update(data).digest("hex");
-        } catch {
-          diskSha = null;
-        }
-      }
-
-      const occupantSha = existingSha || diskSha || null;
-      const occupantIsIndexed = occupantSha && idx[occupantSha] && typeof idx[occupantSha] === "object";
-
-      // (A) SAME-SHA: dedupe (no dup suffix)
-      if (occupantSha && occupantSha === sha256) {
-        actions.push({
-          action: dryRun ? "would_dedupe" : "dedupe",
-          sha256,
-          from: oldRel,
-          to: existingRel,
-          reason: "target_exists_same_sha",
-        });
-
-        const hashShort = String(sha256 || "").slice(0, 8);
-        const tag = dryRun ? "[DRY]" : "[MOVE]";
-        console.log(`${tag} DEDUPE ${hashShort}… ${oldRel}${os.EOL}           -> ${existingRel}`);
-
-        if (!dryRun) {
-          // Delete the redundant file, keep the one already at the target path.
-          try { fs.unlinkSync(oldAbs); } catch {}
-
-          // Update this record to point to the canonical existing location.
-          rec.saved_to = existingRel;
-          rec.termKey = route.termKey;
-          rec.electorateFolder = route.electorateFolder || null;
-          rec.ext = route.ext;
-          rec.last_seen_ts = new Date().toISOString();
-          if (!rec.first_seen_ts) rec.first_seen_ts = rec.last_seen_ts;
-
-          updateLevelManifests(cfg, oldRel, existingRel, sha256);
-
-          savedToSha.set(existingRel, sha256);
-          savedToSha.delete(oldRel);
-        }
-
-        continue; // Important: skip normal conflict suffix logic
-      }
-
-      // (B) DIFFERENT CONTENT: decide whether to displace the occupant
-      //
-      // Incoming file is always indexed content here (we are iterating downloaded_hash_index.json),
-      // so it should take the canonical routed filename UNLESS the occupant is also indexed and
-      // appears to "belong" at this canonical path.
-      let shouldDisplaceOccupant = false;
-
-      if (!occupantIsIndexed) {
-        shouldDisplaceOccupant = true;
-      } else {
-        // Occupant is indexed. If it would NOT route to this same path based on its own sources,
-        // treat it as misplaced and displace it (so each indexed SHA can land on its routed path).
-        try {
-          const occRec = idx[occupantSha];
-          const occSrc = pickBestSource(occRec.sources);
-          if (occSrc?.url) {
-            const occFilenameOverride = path.basename(existingRel);
-            const occRoute = resolveSavePath({
-              downloadsRoot,
-              url: occSrc.url,
-              ext: occRec.ext || null,
-              source_page_url: occSrc.source_page_url || null,
-              electoratesByTerm,
-              filenameOverride: occFilenameOverride,
-            });
-            const occDesiredRel = toRelative(occRoute.outPath);
-            if (occDesiredRel !== existingRel) {
-              shouldDisplaceOccupant = true;
-            }
-          }
-        } catch {
-          // If we cannot evaluate occupant routing, keep it conservative (don't displace).
-          shouldDisplaceOccupant = false;
-        }
-      }
-
-      if (shouldDisplaceOccupant) {
-        const displacedAbs = ensureUniqueTarget(existingAbs, "suffix"); // will return __dupN
-        if (!displacedAbs) {
-          actions.push({
-            action: "conflict_skip",
-            sha256,
-            from: oldRel,
-            to: existingRel,
-            strategy: "suffix",
-            reason: "no_dup_slot_for_displaced_occupant",
-          });
-          continue;
-        }
-
-        const displacedRel = toRelative(displacedAbs);
-
-        actions.push({
-          action: dryRun ? "would_displace" : "displace",
-          sha256_incoming: sha256,
-          sha256_occupant: occupantSha || null,
-          from: existingRel,
-          to: displacedRel,
-          reason: occupantIsIndexed ? "occupant_indexed_but_misplaced" : "occupant_not_indexed",
-        });
-
-        const tag = dryRun ? "[DRY]" : "[MOVE]";
-        console.log(`${tag} DISPLACE ${(occupantSha || "unknown").slice(0, 8)}… ${existingRel}${os.EOL}           -> ${displacedRel}`);
-
-        if (!dryRun) {
-          // Move the occupant out of the way
-          moveFile(existingAbs, displacedAbs, false);
-
-          // If the occupant was indexed, update its record to the displaced path so it won't go "missing"
-          if (occupantIsIndexed) {
-            idx[occupantSha].saved_to = displacedRel;
-            updateLevelManifests(cfg, existingRel, displacedRel, occupantSha);
-            savedToSha.set(displacedRel, occupantSha);
-          }
-          savedToSha.delete(existingRel);
-        }
-
-        // Now the canonical target name is available for the incoming file.
-        forceTargetAbs = existingAbs;
-      }
-    }
-
-    const overwrite = conflict === "overwrite";
-    const targetAbs = forceTargetAbs || ensureUniqueTarget(newAbsDesired, conflict);
-    if (!targetAbs) {
-      actions.push({ action: "conflict_skip", sha256, from: oldRel, to: newRelDesired, strategy: conflict });
-      continue;
-    }
-
-    const targetRel = toRelative(targetAbs);
-    actions.push({
-      action: dryRun ? "would_move" : "move",
-      sha256,
-      from: oldRel,
-      to: targetRel,
-      termKey: route.termKey,
-      electorateFolder: route.electorateFolder || null,
-    });
+    if (samePath) continue;
 
     const hashShort = String(sha256 || "").slice(0, 8);
-    const tag = dryRun ? "[DRY]" : "[MOVE]";
-    console.log(`${tag} MOVE ${hashShort}… ${oldRel}${os.EOL}           -> ${targetRel}`);
 
-    if (!dryRun) {
-      moveFile(oldAbs, targetAbs, overwrite);
-      rec.saved_to = targetRel;
-      rec.termKey = route.termKey;
-      rec.electorateFolder = route.electorateFolder || null;
-      rec.ext = route.ext;
+    // Fast path: empty target
+    if (!fs.existsSync(desiredAbs)) {
+      actions.push({ action: dryRun ? "would_move" : "move", sha256, from: oldRel, to: desiredRel });
+      console.log(`${dryRun ? "[DRY]" : "[MOVE]"} MOVE ${hashShort}… ${oldRel}${os.EOL}           -> ${desiredRel}`);
+      if (dryRun) {
+        wouldMove++;
+      } else {
+        moveFile(oldAbs, desiredAbs, false);
+        rec.saved_to = desiredRel;
+        rec.last_seen_ts = new Date().toISOString();
+        if (!rec.first_seen_ts) rec.first_seen_ts = rec.last_seen_ts;
+        updateLevelManifests(cfg, oldRel, desiredRel, sha256);
+        moved++;
+      }
+      continue;
+    }
+
+    // Occupied target: compare content
+    let occSha = null;
+    try {
+      occSha = sha256File(desiredAbs);
+    } catch {
+      diskHashFailed++;
+      occSha = null;
+    }
+
+    if (occSha && occSha === sha256) {
+      // Same content already at destination: dedupe by adopting canonical path.
+      actions.push({ action: dryRun ? "would_dedupe" : "dedupe", sha256, from: oldRel, to: desiredRel });
+      console.log(`${dryRun ? "[DRY]" : "[APPLY]"} DEDUPE ${hashShort}… ${oldRel}${os.EOL}             => ${desiredRel}`);
+      if (dryRun) {
+        wouldDedupe++;
+      } else {
+        // Delete the old file (it is redundant) and update index to canonical path.
+        try { fs.unlinkSync(oldAbs); } catch {}
+        rec.saved_to = desiredRel;
+        rec.last_seen_ts = new Date().toISOString();
+        if (!rec.first_seen_ts) rec.first_seen_ts = rec.last_seen_ts;
+        updateLevelManifests(cfg, oldRel, desiredRel, sha256);
+        deduped++;
+      }
+      continue;
+    }
+
+    const occIndexed = occSha && Boolean(idx[occSha]);
+
+    // If occupant is indexed, we do NOT overwrite it. We suffix THIS file (twin).
+    if (occIndexed || conflict === "skip") {
+      if (conflict === "skip") {
+        conflictSkip++;
+        actions.push({ action: "conflict_skip", sha256, from: oldRel, to: desiredRel });
+        console.log(`[SKIP] CONFLICT ${hashShort}… ${oldRel}${os.EOL}           !! ${desiredRel} occupied`);
+        continue;
+      }
+
+      const dupAbs = ensureUniqueTarget(desiredAbs);
+      if (!dupAbs) {
+        conflictSkip++;
+        actions.push({ action: "conflict_skip", sha256, from: oldRel, to: desiredRel, note: "no_dup_slot" });
+        continue;
+      }
+      const dupRel = toRelative(dupAbs);
+
+      actions.push({ action: dryRun ? "would_dup" : "dup", sha256, from: oldRel, to: dupRel, canonical_conflict: true });
+      console.log(`${dryRun ? "[DRY]" : "[DUP]"} DUP ${hashShort}… ${oldRel}${os.EOL}          -> ${dupRel}`);
+      if (dryRun) {
+        wouldDup++;
+      } else {
+        moveFile(oldAbs, dupAbs, false);
+        rec.saved_to = dupRel;
+        rec.last_seen_ts = new Date().toISOString();
+        if (!rec.first_seen_ts) rec.first_seen_ts = rec.last_seen_ts;
+        updateLevelManifests(cfg, oldRel, dupRel, sha256);
+        duped++;
+      }
+      continue;
+    }
+
+    // Occupant is NOT indexed: displace it to dup, then place indexed file at canonical path.
+    const displaceAbs = ensureUniqueTarget(desiredAbs);
+    if (!displaceAbs) {
+      conflictSkip++;
+      actions.push({ action: "conflict_skip", sha256, from: oldRel, to: desiredRel, note: "no_displace_slot" });
+      continue;
+    }
+    const displaceRel = toRelative(displaceAbs);
+
+    actions.push({ action: dryRun ? "would_displace" : "displace", sha256, occupied_by_sha256: occSha, displaced_to: displaceRel });
+    actions.push({ action: dryRun ? "would_move" : "move", sha256, from: oldRel, to: desiredRel, after_displace: true });
+
+    console.log(`${dryRun ? "[DRY]" : "[APPLY]"} DISPLACE ${hashShort}… ${desiredRel}${os.EOL}           -> ${displaceRel}`);
+    console.log(`${dryRun ? "[DRY]" : "[MOVE]"} MOVE ${hashShort}… ${oldRel}${os.EOL}           -> ${desiredRel}`);
+
+    if (dryRun) {
+      wouldDisplace++;
+      wouldMove++;
+    } else {
+      moveFile(desiredAbs, displaceAbs, false);
+      displaced++;
+      moveFile(oldAbs, desiredAbs, false);
+      rec.saved_to = desiredRel;
       rec.last_seen_ts = new Date().toISOString();
       if (!rec.first_seen_ts) rec.first_seen_ts = rec.last_seen_ts;
-      updateLevelManifests(cfg, oldRel, targetRel, sha256);
-
-      // Update reverse map
-      savedToSha.set(targetRel, sha256);
-      savedToSha.delete(oldRel);
+      updateLevelManifests(cfg, oldRel, desiredRel, sha256);
+      moved++;
     }
   }
 
@@ -347,13 +282,12 @@ async function resortDownloads({ cfg, downloadsRootOverride, dryRun = true, conf
     appendJsonl(cfg.LOG_FILE_SAVES, { kind: "resort", dryRun, ...a, ts: new Date().toISOString() });
   }
 
-  const moved = actions.filter((x) => x.action === "move").length;
-  const would = actions.filter((x) => x.action === "would_move").length;
-  const missing = actions.filter((x) => x.action === "missing").length;
-  const conflictSkips = actions.filter((x) => x.action === "conflict_skip").length;
-
   console.log(`resort-downloads: processed=${processed} dryRun=${dryRun} conflict=${conflict}`);
-  console.log(`  would_move=${would} moved=${moved} missing=${missing} conflict_skip=${conflictSkips}`);
+  console.log(`  would_move=${wouldMove} moved=${moved} missing=${missing} conflict_skip=${conflictSkip}`);
+  console.log(`  would_dedupe=${wouldDedupe} deduped=${deduped}`);
+  console.log(`  would_dup=${wouldDup} duped=${duped}`);
+  console.log(`  would_displace=${wouldDisplace} displaced=${displaced}`);
+  console.log(`  disk_hash_failed=${diskHashFailed}`);
 }
 
 module.exports = { resortDownloads };

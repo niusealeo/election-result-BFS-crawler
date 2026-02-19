@@ -10,6 +10,7 @@ const { sniffIsPdf, looksLikeHtml } = require("../lib/pdfguard");
 const { appendJsonl } = require("../lib/jsonl");
 const { toAbsolute, toRelative } = require("../lib/paths");
 const { withLock } = require("../lib/lock");
+const { cfgForReq } = require("../lib/domain");
 
 function asArrayUniqueStrings(v) {
   const arr = Array.isArray(v) ? v : (v ? [v] : []);
@@ -120,7 +121,7 @@ function appendToLevelManifest(cfg, level, entry) {
   }
 }
 
-function makeUploadRouter(cfg) {
+function makeUploadRouter(baseCfg) {
   const r = express.Router();
 
   // POST /upload/file
@@ -133,6 +134,7 @@ function makeUploadRouter(cfg) {
   //  - content_base64 (required)
   r.post("/upload/file", async (req, res) => {
     try {
+      const cfg = cfgForReq(baseCfg, req);
       const url = req.body?.url;
       const b64 = req.body?.content_base64;
       const ext = req.body?.ext;

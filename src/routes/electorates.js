@@ -1,11 +1,13 @@
 const express = require("express");
 const { appendJsonl } = require("../lib/jsonl");
 const { cleanElectorateName, loadElectoratesMeta, saveElectoratesMeta } = require("../lib/electorates");
+const { cfgForReq } = require("../lib/domain");
 
-function makeElectoratesRouter(cfg) {
+function makeElectoratesRouter(baseCfg) {
   const r = express.Router();
 
   r.post("/meta/electorates", (req, res) => {
+    const cfg = cfgForReq(baseCfg, req);
     const { termKey, official_order, alphabetical_order } = req.body || {};
     if (!termKey || !official_order || !alphabetical_order) {
       return res.status(400).json({ ok: false, error: "Expected { termKey, official_order, alphabetical_order }" });
@@ -38,9 +40,13 @@ function makeElectoratesRouter(cfg) {
     res.json({ ok: true, termKey, count: Object.keys(cleanedOfficial).length });
   });
 
-  r.get("/meta/electorates", (_req, res) => res.json(loadElectoratesMeta(cfg.ELECTORATES_BY_TERM_PATH)));
+  r.get("/meta/electorates", (req, res) => {
+    const cfg = cfgForReq(baseCfg, req);
+    res.json(loadElectoratesMeta(cfg.ELECTORATES_BY_TERM_PATH));
+  });
 
-  r.post("/meta/electorates/reset", (_req, res) => {
+  r.post("/meta/electorates/reset", (req, res) => {
+    const cfg = cfgForReq(baseCfg, req);
     saveElectoratesMeta(cfg.ELECTORATES_BY_TERM_PATH, {});
     appendJsonl(cfg.LOG_ELECTORATES_INGEST, { ts: new Date().toISOString(), action: "reset" });
     res.json({ ok: true });

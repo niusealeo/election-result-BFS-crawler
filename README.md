@@ -1,6 +1,6 @@
 # Sink — a homecooked Postman API (BFS crawl + file downloader)
 
-The core purpose of this repo was originally to download a curated copy of MMP election result files from NZ election websites. That purpose has now been satisfied, and to reduce load on the Electoral Commission's website servers the results for 1996-2025 can now be downloaded in a compact zip from OneDrive storage [here](https://1drv.ms/u/c/6262763291824deb/IQCAyKKgjBEFQIcC3x3cZLgNARTxE3f9K8gQspZH-4PGsNQ?e=xhmpBP).
+The core purpose of this repo was originally to download a curated copy of MMP election result files from NZ election websites. That purpose has now been satisfied, and to reduce load on the Electoral Commission's website servers the results for 1996-2025 can now be downloaded in a compact zip from OneDrive storage [here](https://1drv.ms/f/c/6262763291824deb/IgClU6VQnW9JSq52bHpU8fAaAXAR-guoYVUiilRHhFhJFdA?e=OPInTk).
 To check for subsequent updates, the election servers can be rescanned for new pages and pinged with a meta probe to check for file diffs with this repo.
 
 The main branch of this repo has since evolved into a more generic purpose semi-automatic webcrawler that can be manually used to statefully index the web layout of any website domain pages and their associated exposed file urls, and identifying any diffs or updates during crawling reruns.

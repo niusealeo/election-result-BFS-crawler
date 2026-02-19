@@ -178,6 +178,16 @@ Outputs stored under:
 ### Step 1 — Discover Links (BFS)
 Postman fetches pages (GET) and extracts links (href/src/etc) and emits URL rows to sink.
 
+**Two compatible collection modes:**
+- **Legacy (single-batch):** accumulates discoveries inside Postman and calls `POST /dedupe/level` once at the end of the run. Good for small/medium levels.
+- **Streaming (large-run):** sends discoveries to sink in chunks using `POST /runs/start/urls`, `POST /runs/append/urls`, then `POST /runs/finalize/urls`. This avoids Postman memory limits on 10k+ URL levels.
+
+This repo ships both Postman collection files so you can choose per run:
+- `NZ Elections.postman_collection.legacy.json`
+- `NZ Elections.postman_collection.streaming.json` (also copied as `NZ Elections.postman_collection.json`)
+
+Sink supports **both** modes simultaneously.
+
 Sink writes:
 - `_meta/<domain>/levels/urls-level-L.json`
 - `_meta/<domain>/levels/files-level-L.json` (file candidates found at that level)

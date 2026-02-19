@@ -380,17 +380,50 @@ function scanDownloadsDiskFirst({ cfg, downloadsRoot, dryRun, conflict, idx, sav
       continue;
     }
 
-    // CASE 2: content not in index -> unknown file: rename with dup suffix
-    // (so it cannot be mistaken for canonical content)
+    // CASE 2: content not in index -> unknown file
+    // Only apply __dupN if there is a "twin" (a competing identity).
+
+    // Define identity = filename without trailing __dupN
     const ext = path.extname(absN);
-
-    let base = path.basename(absN, ext);
-
-    // Remove existing __dupN suffix before re-suffixing
-    base = base.replace(/__dup\d+$/i, "");
-
     const dir = path.dirname(absN);
 
+    let base = path.basename(absN, ext);
+    base = base.replace(/__dup\d+$/i, ""); // strip existing dup suffix for identity
+
+    // Twin condition A: there is a sibling file with same identity but different filename
+    let hasSiblingTwin = false;
+    try {
+      const siblings = fs.readdirSync(dir);
+      for (const f of siblings) {
+        if (f === path.basename(absN)) continue;
+        const fExt = path.extname(f);
+        const fBase = path.basename(f, fExt).replace(/__dup\d+$/i, "");
+        if (fExt.toLowerCase() === ext.toLowerCase() && fBase === base) {
+          hasSiblingTwin = true;
+          break;
+        }
+      }
+    } catch { }
+
+    // Twin condition B: routing would move it to a path that is already occupied
+    // (If you don't have a routed target for unknowns, you can skip this one.)
+    let hasTargetTwin = false;
+    // If you have a "desiredRel" computation available for disk-unknowns, set hasTargetTwin=true when occupied.
+    // Otherwise just rely on sibling twin.
+    if (!hasSiblingTwin && hasTargetTwin === false) {
+      // No competing identity -> leave it alone
+      actions.push({
+        action: "leave_unindexed_no_twin",
+        sha256: sha,
+        saved_to: rel,
+        reason: "unindexed_no_competing_twin",
+      });
+      // Optional: print for debugging (comment out if too noisy)
+      // console.log(`${tag} KEEP   ${hashShort}… ${rel}  (no twin)`);
+      continue;
+    }
+
+    // If we got here, it has a twin -> apply dup suffix
     let newAbs = null;
     for (let i = 1; i < 1000; i++) {
       const cand = path.join(dir, `${base}__dup${i}${ext}`);
@@ -413,7 +446,7 @@ function scanDownloadsDiskFirst({ cfg, downloadsRoot, dryRun, conflict, idx, sav
       sha256: sha,
       from: rel,
       to: newRel,
-      reason: "disk_file_hash_not_in_index",
+      reason: "disk_file_hash_not_in_index_has_twin",
     });
 
     console.log(`${tag} DUP    ${hashShort}… ${rel}${os.EOL}           -> ${newRel}`);
@@ -422,7 +455,6 @@ function scanDownloadsDiskFirst({ cfg, downloadsRoot, dryRun, conflict, idx, sav
       try {
         fs.renameSync(absN, newAbs);
       } catch {
-        // fallback copy+delete
         fs.copyFileSync(absN, newAbs);
         try { fs.unlinkSync(absN); } catch { }
       }

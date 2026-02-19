@@ -135,7 +135,7 @@ function termKeyForEvent(eventYear, monthOpt, electoratesByTerm) {
     // If month unknown: prefer prior term (conservative for by-elections/referenda).
     // Rationale: these pages are typically organized by the Parliament/term the event
     // occurred *during*, and GE-year events overwhelmingly happen before the GE.
-    if (!hasMonth) return terms[idx - 1].k;
+    // if (!hasMonth) return terms[idx - 1].k;
   }
 
   return base;

@@ -35,13 +35,13 @@ function ensureUniqueTarget(targetAbs, strategy) {
 function moveFile(oldAbs, newAbs, overwrite) {
   ensureDir(path.dirname(newAbs));
   if (overwrite && fs.existsSync(newAbs)) {
-    try { fs.unlinkSync(newAbs); } catch {}
+    try { fs.unlinkSync(newAbs); } catch { }
   }
   try {
     fs.renameSync(oldAbs, newAbs);
   } catch {
     fs.copyFileSync(oldAbs, newAbs);
-    try { fs.unlinkSync(oldAbs); } catch {}
+    try { fs.unlinkSync(oldAbs); } catch { }
   }
 }
 
@@ -98,6 +98,14 @@ async function resortDownloads({ cfg, downloadsRootOverride, dryRun = true, conf
   const electoratesByTerm = loadElectoratesMeta(cfg.ELECTORATES_BY_TERM_PATH);
   const idx = readJsonSafe(cfg.DOWNLOADED_HASH_INDEX_PATH, {});
 
+  // Reverse index: saved_to (relative) -> sha256
+  // Used to dedupe during resort when a target path already exists.
+  const savedToSha = new Map();
+  for (const [h, r] of Object.entries(idx)) {
+    const p = r && typeof r === "object" ? r.saved_to : null;
+    if (p) savedToSha.set(p, h);
+  }
+
   const actions = [];
   let processed = 0;
 
@@ -142,6 +150,57 @@ async function resortDownloads({ cfg, downloadsRootOverride, dryRun = true, conf
       continue;
     }
 
+    // If the desired target path already exists AND it's the SAME content hash,
+    // do not create __dupN. Just delete the old file and point this record at the target.
+    if (fs.existsSync(newAbsDesired)) {
+      const existingRel = newRelDesired;               // toRelative(newAbsDesired)
+      const existingSha = savedToSha.get(existingRel); // who already "owns" this path?
+      let diskSha = null;
+
+      if (!existingSha) {
+        // Target exists but not in index — hash it directly.
+        const crypto = require("crypto");
+        const data = fs.readFileSync(newAbsDesired);
+        diskSha = crypto.createHash("sha256").update(data).digest("hex");
+      }
+
+      if (existingSha === sha256 || diskSha === sha256) {
+        actions.push({
+          action: dryRun ? "would_dedupe" : "dedupe",
+          sha256,
+          from: oldRel,
+          to: existingRel,
+          reason: "target_exists_same_sha",
+        });
+
+        // Print like your MOVE lines (so you can see it in dry run)
+        const hashShort = String(sha256 || "").slice(0, 8);
+        const tag = dryRun ? "[DRY]" : "[MOVE]";
+        console.log(`${tag} DEDUPE ${hashShort}… ${oldRel}${os.EOL}           -> ${existingRel}`);
+
+        if (!dryRun) {
+          // Delete the redundant file, keep the one already at the target path.
+          try { fs.unlinkSync(oldAbs); } catch { }
+
+          // Update this record to point to the canonical existing location.
+          rec.saved_to = existingRel;
+          rec.termKey = route.termKey;
+          rec.electorateFolder = route.electorateFolder || null;
+          rec.ext = route.ext;
+          rec.last_seen_ts = new Date().toISOString();
+          if (!rec.first_seen_ts) rec.first_seen_ts = rec.last_seen_ts;
+
+          updateLevelManifests(cfg, oldRel, existingRel, sha256);
+
+          // Keep the reverse map consistent in case later records rely on it.
+          savedToSha.set(existingRel, sha256);
+          savedToSha.delete(oldRel);
+        }
+
+        continue; // Important: skip normal conflict suffix logic
+      }
+    }
+
     const overwrite = conflict === "overwrite";
     const targetAbs = ensureUniqueTarget(newAbsDesired, conflict);
     if (!targetAbs) {
@@ -160,9 +219,9 @@ async function resortDownloads({ cfg, downloadsRootOverride, dryRun = true, conf
     });
 
     // Print planned moves in dry-run (and also in apply mode, for traceability)
-const hashShort = String(sha256 || "").slice(0, 8);
-const tag = dryRun ? "[DRY]" : "[MOVE]";
-console.log(`${tag} MOVE ${hashShort}… ${oldRel}${os.EOL}           -> ${targetRel}`);
+    const hashShort = String(sha256 || "").slice(0, 8);
+    const tag = dryRun ? "[DRY]" : "[MOVE]";
+    console.log(`${tag} MOVE ${hashShort}… ${oldRel}${os.EOL}           -> ${targetRel}`);
 
     if (!dryRun) {
       moveFile(oldAbs, targetAbs, overwrite);
@@ -175,6 +234,10 @@ console.log(`${tag} MOVE ${hashShort}… ${oldRel}${os.EOL}           -> ${targe
       updateLevelManifests(cfg, oldRel, targetRel, sha256);
     }
   }
+
+  // Phase B: disk-first dedupe (handle files present on disk but not represented in the hash index)
+  scanDownloadsDiskFirst({ cfg, downloadsRoot, dryRun, conflict, idx, savedToSha, actions });
+
 
   if (!dryRun) {
     writeJson(cfg.DOWNLOADED_HASH_INDEX_PATH, idx);
@@ -191,6 +254,180 @@ console.log(`${tag} MOVE ${hashShort}… ${oldRel}${os.EOL}           -> ${targe
 
   console.log(`resort-downloads: processed=${processed} dryRun=${dryRun} conflict=${conflict}`);
   console.log(`  would_move=${would} moved=${moved} missing=${missing} conflict_skip=${conflictSkips}`);
+}
+
+function walkFilesRec(dirAbs, out = []) {
+  let entries;
+  try {
+    entries = fs.readdirSync(dirAbs, { withFileTypes: true });
+  } catch {
+    return out;
+  }
+  for (const ent of entries) {
+    const p = path.join(dirAbs, ent.name);
+    if (ent.isDirectory()) walkFilesRec(p, out);
+    else if (ent.isFile()) out.push(p);
+  }
+  return out;
+}
+
+function sha256FileAbs(absPath) {
+  const crypto = require("crypto");
+  const h = crypto.createHash("sha256");
+  const buf = fs.readFileSync(absPath);
+  h.update(buf);
+  return h.digest("hex");
+}
+
+/**
+ * Disk-first dedupe scan:
+ * - For every file physically present under downloadsRoot:
+ *   - compute sha256
+ *   - if sha exists in idx -> dedupe file into idx[sha].saved_to (canonical)
+ *   - else -> rename with __dupN (unknown content must not silently masquerade as canonical)
+ */
+function scanDownloadsDiskFirst({ cfg, downloadsRoot, dryRun, conflict, idx, savedToSha, actions }) {
+  const filesOnDisk = walkFilesRec(downloadsRoot, []);
+  if (!filesOnDisk.length) return;
+
+  // Build a set of indexed on-disk locations (so we can ignore already-tracked files)
+  const indexedAbs = new Set();
+  for (const rec of Object.values(idx)) {
+    const rel = rec && typeof rec === "object" ? rec.saved_to : null;
+    if (!rel) continue;
+    const abs = toAbsolute(rel);
+    indexedAbs.add(path.resolve(abs));
+  }
+
+  for (const abs of filesOnDisk) {
+    const absN = path.resolve(abs);
+
+    // Skip files already represented in the index by location.
+    if (indexedAbs.has(absN)) continue;
+
+    const rel = toRelative(absN);
+    let sha = null;
+
+    try {
+      sha = sha256FileAbs(absN);
+    } catch (e) {
+      actions.push({ action: "disk_hash_failed", saved_to: rel, error: String(e) });
+      continue;
+    }
+
+    const hashShort = String(sha || "").slice(0, 8);
+    const tag = dryRun ? "[DRY]" : "[MOVE]";
+
+    // CASE 1: content exists in index -> dedupe into canonical saved_to
+    if (idx[sha]) {
+      const rec = idx[sha];
+      const canonicalRel = rec.saved_to;
+
+      // If index record is missing a saved_to, treat this disk file as canonical (adopt it)
+      if (!canonicalRel) {
+        actions.push({
+          action: dryRun ? "would_adopt_unindexed" : "adopt_unindexed",
+          sha256: sha,
+          from: rel,
+          to: rel,
+          reason: "index_missing_saved_to",
+        });
+        console.log(`${tag} ADOPT  ${hashShort}… ${rel}`);
+        if (!dryRun) {
+          rec.saved_to = rel;
+          savedToSha.set(rel, sha);
+        }
+        continue;
+      }
+
+      const canonicalAbs = toAbsolute(canonicalRel);
+
+      // If canonical file exists, delete this duplicate copy
+      if (fs.existsSync(canonicalAbs)) {
+        actions.push({
+          action: dryRun ? "would_dedupe_disk" : "dedupe_disk",
+          sha256: sha,
+          from: rel,
+          to: canonicalRel,
+          reason: "disk_file_hash_in_index",
+        });
+        console.log(`${tag} DEDUPE ${hashShort}… ${rel}${os.EOL}           -> ${canonicalRel}`);
+        if (!dryRun) {
+          try { fs.unlinkSync(absN); } catch { }
+        }
+        continue;
+      }
+
+      // Canonical path missing on disk: promote this disk file into canonical location
+      actions.push({
+        action: dryRun ? "would_promote_disk" : "promote_disk",
+        sha256: sha,
+        from: rel,
+        to: canonicalRel,
+        reason: "canonical_missing_promote_disk_copy",
+      });
+      console.log(`${tag} PROMOTE ${hashShort}… ${rel}${os.EOL}           -> ${canonicalRel}`);
+
+      if (!dryRun) {
+        const overwrite = conflict === "overwrite";
+        const targetAbs = ensureUniqueTarget(canonicalAbs, overwrite ? "overwrite" : "suffix") || canonicalAbs;
+        moveFile(absN, targetAbs, overwrite);
+        const targetRel = toRelative(targetAbs);
+        rec.saved_to = targetRel;
+        savedToSha.set(targetRel, sha);
+      }
+
+      continue;
+    }
+
+    // CASE 2: content not in index -> unknown file: rename with dup suffix
+    // (so it cannot be mistaken for canonical content)
+    const ext = path.extname(absN);
+
+    let base = path.basename(absN, ext);
+
+    // Remove existing __dupN suffix before re-suffixing
+    base = base.replace(/__dup\d+$/i, "");
+
+    const dir = path.dirname(absN);
+
+    let newAbs = null;
+    for (let i = 1; i < 1000; i++) {
+      const cand = path.join(dir, `${base}__dup${i}${ext}`);
+      if (!fs.existsSync(cand)) {
+        newAbs = cand;
+        break;
+      }
+    }
+
+    if (!newAbs) {
+      actions.push({ action: "disk_unindexed_no_slot", saved_to: rel, sha256: sha });
+      console.log(`${tag} UNK    ${hashShort}… ${rel}  (no dup slot available)`);
+      continue;
+    }
+
+    const newRel = toRelative(newAbs);
+
+    actions.push({
+      action: dryRun ? "would_dup_unindexed" : "dup_unindexed",
+      sha256: sha,
+      from: rel,
+      to: newRel,
+      reason: "disk_file_hash_not_in_index",
+    });
+
+    console.log(`${tag} DUP    ${hashShort}… ${rel}${os.EOL}           -> ${newRel}`);
+
+    if (!dryRun) {
+      try {
+        fs.renameSync(absN, newAbs);
+      } catch {
+        // fallback copy+delete
+        fs.copyFileSync(absN, newAbs);
+        try { fs.unlinkSync(absN); } catch { }
+      }
+    }
+  }
 }
 
 module.exports = { resortDownloads };

@@ -208,27 +208,27 @@ function electorateFolderFor(termKey, url, electoratesByTerm) {
   }
 
   // SPECIAL: Terms 47–51 exports often look like e9_part8_cand_63.csv
-// Here e9 = election id, and only trailing cand_## or party_## indicates electorate.
-const looksLikeElectionIdPrefix = /^e\d{1,3}_/i.test(filenameRaw);
+  // Here e9 = election id, and only trailing cand_## or party_## indicates electorate.
+  const looksLikeElectionIdPrefix = /^e\d{1,3}_/i.test(filenameRaw);
 
-if (isArchiveElectionIdPath || looksLikeElectionIdPrefix) {
+  if (isArchiveElectionIdPath || looksLikeElectionIdPrefix) {
 
-  // cand_##
-  let mm = filenameRaw.match(/(?:^|[_-])cand[_-]?(\d{1,3})(?=\D|$)/i);
-  if (mm) {
-    const n = Number(mm[1]);
-    const name = official[String(n)];
-    if (name) return `${String(n).padStart(3, "0")}_${name}`;
+    // cand_##
+    let mm = filenameRaw.match(/(?:^|[_-])cand[_-]?(\d{1,3})(?=\D|$)/i);
+    if (mm) {
+      const n = Number(mm[1]);
+      const name = official[String(n)];
+      if (name) return `${String(n).padStart(3, "0")}_${name}`;
+    }
+
+    // party_##
+    mm = filenameRaw.match(/(?:^|[_-])party[_-]?(\d{1,3})(?=\D|$)/i);
+    if (mm) {
+      const n = Number(mm[1]);
+      const name = official[String(n)];
+      if (name) return `${String(n).padStart(3, "0")}_${name}`;
+    }
   }
-
-  // party_##
-  mm = filenameRaw.match(/(?:^|[_-])party[_-]?(\d{1,3})(?=\D|$)/i);
-  if (mm) {
-    const n = Number(mm[1]);
-    const name = official[String(n)];
-    if (name) return `${String(n).padStart(3, "0")}_${name}`;
-  }
-}
 
 
   // PRIORITY 2a: explicit electorate/voting-place numbering in filename
@@ -335,8 +335,11 @@ function resolveSavePath({ downloadsRoot, url, ext, source_page_url, electorates
     (sourceUrl ? parseMonthFromNameOrUrl(sourceUrl) : null) ||
     parseMonthFromNameOrUrl(fileUrl);
 
-  const yearMatch = fileUrl.match(/\b(19\d{2}|20\d{2})\b/);
+  // Match a 4-digit year that is not part of a longer number.
+  // Works for "2016_flag_..." (underscore is fine).
+  const yearMatch = fileUrl.match(/(?:^|[^0-9])(19\d{2}|20\d{2})(?=[^0-9]|$)/);
   const eventYear = yearMatch ? Number(yearMatch[1]) : NaN;
+
 
   let termKey = isStateChange
     ? termKeyForEvent(eventYear, monthOpt, electoratesByTerm)

@@ -80,6 +80,14 @@ function updateLevelManifests(cfg, oldRel, newRel, sha256) {
   }
 }
 
+function sha256File(absPath) {
+  const crypto = require("crypto");
+  const h = crypto.createHash("sha256");
+  const buf = fs.readFileSync(absPath);
+  h.update(buf);
+  return h.digest("hex");
+}
+
 /**
  * Resort already-downloaded files using routing.js.
  *
@@ -141,6 +149,7 @@ async function resortDownloads({ cfg, downloadsRootOverride, dryRun = true, conf
 
     const newAbsDesired = route.outPath;
     const newRelDesired = toRelative(newAbsDesired);
+    let forceTargetAbs = null;
 
     const samePath = path.resolve(oldAbs) === path.resolve(newAbsDesired);
     if (samePath) {
@@ -150,21 +159,30 @@ async function resortDownloads({ cfg, downloadsRootOverride, dryRun = true, conf
       continue;
     }
 
-    // If the desired target path already exists AND it's the SAME content hash,
-    // do not create __dupN. Just delete the old file and point this record at the target.
+    // Target exists handling (dedupe / canonical conflict)
     if (fs.existsSync(newAbsDesired)) {
-      const existingRel = newRelDesired;               // toRelative(newAbsDesired)
-      const existingSha = savedToSha.get(existingRel); // who already "owns" this path?
-      let diskSha = null;
+      const existingRel = newRelDesired;
+
+      // Try to identify what SHA "owns" the existing target.
+      // Prefer index reverse map; if absent, hash the file on disk and see if it's indexed.
+      let existingSha = savedToSha.get(existingRel) || null;
 
       if (!existingSha) {
-        // Target exists but not in index — hash it directly.
-        const crypto = require("crypto");
-        const data = fs.readFileSync(newAbsDesired);
-        diskSha = crypto.createHash("sha256").update(data).digest("hex");
+        try {
+          const diskSha = sha256File(newAbsDesired);
+          if (idx[diskSha]) {
+            existingSha = diskSha;
+            // adopt into reverse map so later checks are cheap
+            savedToSha.set(existingRel, existingSha);
+          }
+        } catch {
+          // If we cannot hash, treat as unknown occupant and fall through to suffix strategy.
+          existingSha = null;
+        }
       }
 
-      if (existingSha === sha256 || diskSha === sha256) {
+      // (A) SAME-SHA: canonical dedupe (no dup suffix)
+      if (existingSha && existingSha === sha256) {
         actions.push({
           action: dryRun ? "would_dedupe" : "dedupe",
           sha256,
@@ -173,16 +191,14 @@ async function resortDownloads({ cfg, downloadsRootOverride, dryRun = true, conf
           reason: "target_exists_same_sha",
         });
 
-        // Print like your MOVE lines (so you can see it in dry run)
         const hashShort = String(sha256 || "").slice(0, 8);
         const tag = dryRun ? "[DRY]" : "[MOVE]";
         console.log(`${tag} DEDUPE ${hashShort}… ${oldRel}${os.EOL}           -> ${existingRel}`);
 
         if (!dryRun) {
-          // Delete the redundant file, keep the one already at the target path.
           try { fs.unlinkSync(oldAbs); } catch { }
 
-          // Update this record to point to the canonical existing location.
+          // Point this record at the canonical existing location.
           rec.saved_to = existingRel;
           rec.termKey = route.termKey;
           rec.electorateFolder = route.electorateFolder || null;
@@ -192,17 +208,78 @@ async function resortDownloads({ cfg, downloadsRootOverride, dryRun = true, conf
 
           updateLevelManifests(cfg, oldRel, existingRel, sha256);
 
-          // Keep the reverse map consistent in case later records rely on it.
           savedToSha.set(existingRel, sha256);
           savedToSha.delete(oldRel);
         }
 
-        continue; // Important: skip normal conflict suffix logic
+        continue; // skip normal conflict suffix logic
+      }
+
+      // (B) DIFFERENT-SHA: canonical-to-index wins the canonical filename
+      //
+      // Rules:
+      // 1) If existing file is canonical to index at this path -> incoming becomes __dupN
+      // 2) If incoming file is canonical to index at this path -> existing gets renamed to __dupN, incoming takes canonical
+      // 3) If neither is canonical -> keep existing canonical name, suffix incoming (safe)
+      // 4) If both claim canonical (shouldn't happen) -> keep existing, suffix incoming, log
+      const existingCanonical =
+        existingSha && idx[existingSha] && idx[existingSha].saved_to === existingRel;
+
+      const incomingCanonical =
+        idx[sha256] && idx[sha256].saved_to === existingRel;
+
+      if (incomingCanonical && !existingCanonical) {
+        // Existing occupant is NOT canonical; rename it away, then let incoming take canonical path.
+        const overwrite = false;
+        const existingAbs = newAbsDesired;
+
+        // Move existing file out of the way with dup suffix
+        const displacedAbs = ensureUniqueTarget(existingAbs, "suffix");
+        if (!displacedAbs) {
+          actions.push({ action: "conflict_skip", sha256, from: oldRel, to: existingRel, strategy: "suffix", reason: "no_dup_slot_for_displaced" });
+          continue;
+        }
+
+        // IMPORTANT: tell later code to skip suffix logic
+        forceTargetAbs = newAbsDesired;
+
+        const displacedRel = toRelative(displacedAbs);
+
+        actions.push({
+          action: dryRun ? "would_displace_existing" : "displace_existing",
+          sha256_existing: existingSha || null,
+          from: existingRel,
+          to: displacedRel,
+          reason: "incoming_is_index_canonical",
+        });
+
+        const tag = dryRun ? "[DRY]" : "[MOVE]";
+        console.log(`${tag} SWAP     ${sha256.slice(0, 8)}… ${oldRel}${os.EOL}           -> ${existingRel}`);
+        console.log(`${tag} DISPLACE ${(existingSha || "unknown").slice(0, 8)}… ${existingRel}${os.EOL}           -> ${displacedRel}`);
+
+        if (!dryRun) {
+          moveFile(existingAbs, displacedAbs, overwrite);
+
+          // If the displaced file was indexed (we knew its sha), update that record to its new path
+          if (existingSha && idx[existingSha]) {
+            idx[existingSha].saved_to = displacedRel;
+            updateLevelManifests(cfg, existingRel, displacedRel, existingSha);
+          }
+
+          savedToSha.delete(existingRel);
+          if (existingSha) savedToSha.set(displacedRel, existingSha);
+        }
+
+        // Now proceed with normal move logic into existingRel (no suffix).
+        // (fall through; DO NOT continue)
+      } else {
+        // Existing is canonical OR incoming not canonical -> incoming should be dup-suffixed by normal conflict logic
+        // (fall through to ensureUniqueTarget below)
       }
     }
 
     const overwrite = conflict === "overwrite";
-    const targetAbs = ensureUniqueTarget(newAbsDesired, conflict);
+    const targetAbs = forceTargetAbs || ensureUniqueTarget(newAbsDesired, conflict);
     if (!targetAbs) {
       actions.push({ action: "conflict_skip", sha256, from: oldRel, to: newRelDesired, strategy: conflict });
       continue;
@@ -221,7 +298,11 @@ async function resortDownloads({ cfg, downloadsRootOverride, dryRun = true, conf
     // Print planned moves in dry-run (and also in apply mode, for traceability)
     const hashShort = String(sha256 || "").slice(0, 8);
     const tag = dryRun ? "[DRY]" : "[MOVE]";
-    console.log(`${tag} MOVE ${hashShort}… ${oldRel}${os.EOL}           -> ${targetRel}`);
+    const isDupTarget = (targetRel !== newRelDesired);
+
+    const verb = isDupTarget ? "DUP" : "MOVE";
+    console.log(`${tag} ${verb} ${hashShort}… ${oldRel}${os.EOL}           -> ${targetRel}`);
+
 
     if (!dryRun) {
       moveFile(oldAbs, targetAbs, overwrite);

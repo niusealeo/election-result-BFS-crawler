@@ -282,6 +282,16 @@ async function resortDownloads({ cfg, downloadsRootOverride, dryRun = true, conf
     appendJsonl(cfg.LOG_FILE_SAVES, { kind: "resort", dryRun, ...a, ts: new Date().toISOString() });
   }
 
+  // List missing indexed files (present in index, absent on disk)
+  const missingRows = actions.filter((a) => a.action === "missing");
+  if (missingRows.length) {
+    console.log(`missing files (${missingRows.length}):`);
+    for (const m of missingRows) {
+      const h = String(m.sha256 || "").slice(0, 8);
+      console.log(`  - ${h}… ${m.saved_to}`);
+    }
+  }
+
   console.log(`resort-downloads: processed=${processed} dryRun=${dryRun} conflict=${conflict}`);
   console.log(`  would_move=${wouldMove} moved=${moved} missing=${missing} conflict_skip=${conflictSkip}`);
   console.log(`  would_dedupe=${wouldDedupe} deduped=${deduped}`);

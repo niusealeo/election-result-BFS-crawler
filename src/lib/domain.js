@@ -88,9 +88,11 @@ function domainCfg(baseCfg, domainKey) {
     // Domain-scoped logs
     LOG_DEDUPE: path.join(RUNS_DIR, "dedupe_log.jsonl"),
     LOG_FILE_SAVES: path.join(RUNS_DIR, "file_saves.jsonl"),
-    LOG_ELECTORATES_INGEST: path.join(RUNS_DIR, "electorates_ingest.jsonl"),
-    LOG_LEVEL_RESETS: path.join(RUNS_DIR, "level_resets.jsonl"),
-    LOG_META_PROBES: path.join(RUNS_DIR, "meta_probes.jsonl"),
+    // These are part of persistent crawl state and should live under _meta/<domain>/
+    // so that a domain's full state can be reconstructed without depending on runs/.
+    LOG_ELECTORATES_INGEST: path.join(META_DIR, "electorates_by_term.jsonl"),
+    LOG_LEVEL_RESETS: path.join(META_DIR, "level_resets.jsonl"),
+    LOG_META_PROBES: path.join(META_DIR, "meta_probes.jsonl"),
   };
 }
 

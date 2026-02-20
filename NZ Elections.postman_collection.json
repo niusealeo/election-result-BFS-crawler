@@ -284,9 +284,21 @@
               "\r",
               "function normalizeUrl(u) {\r",
               "  if (!u) return u;\r",
-              "  // Fix common HTML-entity leakage in query strings (&amp;... or repeated amp;)\r",
-              "  let cleaned = String(u).replace(/amp;/g, \"\");\r",
-              "  try { return new URL(cleaned).toString(); } catch { return cleaned; }\r",
+              "  let s = String(u);\r",
+              "\r",
+              "  // Only fix HTML entity leakage, not arbitrary \"amp;\" text\r",
+              "  // 1) turn \"&amp;\" into \"&\"\r",
+              "  s = s.replace(/&amp;/g, \"&\");\r",
+              "\r",
+              "  // 2) remove repeated entity leftovers like \"&amp;amp;\" → \"&\"\r",
+              "  // (run a few passes until stable)\r",
+              "  for (let i = 0; i < 5; i++) {\r",
+              "    const prev = s;\r",
+              "    s = s.replace(/&amp;/g, \"&\");\r",
+              "    if (s === prev) break;\r",
+              "  }\r",
+              "\r",
+              "  try { return new URL(s).toString(); } catch { return s; }\r",
               "}\r",
               "\r",
               "function toAbs(href) {\r",
@@ -441,7 +453,10 @@
         "method": "GET",
         "header": [],
         "url": {
-          "raw": "{{url}}"
+          "raw": "{{url}}",
+          "host": [
+            "{{url}}"
+          ]
         }
       },
       "response": []
@@ -492,11 +507,24 @@
               "    h.startsWith(\"tel:\")\r",
               "  );\r",
               "}\r",
+              "\r",
               "function normalizeUrl(u) {\r",
               "  if (!u) return u;\r",
-              "  // Fix common HTML-entity leakage in query strings (&amp;... or repeated amp;)\r",
-              "  let cleaned = String(u).replace(/amp;/g, \"\");\r",
-              "  try { return new URL(cleaned).toString(); } catch { return cleaned; }\r",
+              "  let s = String(u);\r",
+              "\r",
+              "  // Only fix HTML entity leakage, not arbitrary \"amp;\" text\r",
+              "  // 1) turn \"&amp;\" into \"&\"\r",
+              "  s = s.replace(/&amp;/g, \"&\");\r",
+              "\r",
+              "  // 2) remove repeated entity leftovers like \"&amp;amp;\" → \"&\"\r",
+              "  // (run a few passes until stable)\r",
+              "  for (let i = 0; i < 5; i++) {\r",
+              "    const prev = s;\r",
+              "    s = s.replace(/&amp;/g, \"&\");\r",
+              "    if (s === prev) break;\r",
+              "  }\r",
+              "\r",
+              "  try { return new URL(s).toString(); } catch { return s; }\r",
               "}\r",
               "\r",
               "function toAbs(href) {\r",
@@ -531,11 +559,10 @@
               "  if (!abs.startsWith(origin)) continue;\r",
               "\r",
               "  if (isDownloadableFile(abs)) {\r",
-              "    deltaFiles.push({ url: abs, ext: extOf(abs) || \"bin\", source_page_url: currentUrl });\r",
-              "  } else {\r",
-              "    deltaPages.push({ url: abs });\r",
+              "    deltaFiles.push({ url: abs, ext: extOf(abs) || \"bin\", source_page_url: currentUrl }); continue;\r",
               "  }\r",
               "  if (isJunkAssetUrl(abs)) continue;\r",
+              "  deltaPages.push({ url: abs });\r",
               "}\r",
               "\r",
               "// Buffer deltas in small batches to avoid spamming the sink\r",
@@ -669,7 +696,10 @@
         "method": "GET",
         "header": [],
         "url": {
-          "raw": "{{url}}"
+          "raw": "{{url}}",
+          "host": [
+            "{{url}}"
+          ]
         }
       },
       "response": []
@@ -978,10 +1008,6 @@
   ],
   "variable": [
     {
-      "key": "DISCOVER_LEVEL",
-      "value": ""
-    },
-    {
       "key": "discoveredLinks",
       "value": ""
     },
@@ -1027,6 +1053,22 @@
     },
     {
       "key": "DISCOVER_kind",
+      "value": ""
+    },
+    {
+      "key": "DISCOVER_RUN_ID",
+      "value": ""
+    },
+    {
+      "key": "DISCOVER_BUF_pages",
+      "value": ""
+    },
+    {
+      "key": "DISCOVER_BUF_files",
+      "value": ""
+    },
+    {
+      "key": "DISCOVER_BUF_visited",
       "value": ""
     }
   ]

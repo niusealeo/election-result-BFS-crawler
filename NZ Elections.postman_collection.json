@@ -1,6 +1,6 @@
 {
   "info": {
-    "_postman_id": "68affbb6-d3a2-43f9-b96d-f945eea51e7d",
+    "_postman_id": "43cc9ef8-bac5-4c6e-a456-361b55a3a887",
     "name": "NZ Elections",
     "description": "This Breadth First Search Crawler requires an initial seed url in a Postman collections runner commpatible json format to begin. This crawler collects urls and identifies several data file types.\n\n[urls-level-1.json](https://github.com/niusealeo/election-result-BFS-crawler/blob/main/BFS_crawl/_meta/electionresults.govt.nz/artifacts/urls-level-1.json) is available to use as an example of a top level domain to begin searching the website: [https://www.electionresults.govt.nz/](https://www.electionresults.govt.nz/) , but any website url could be used instead.\n\nThis Postman collection runner \"API\" requires to be run locally on a Postman desktop app so it can work side-by-side with a locally served \"Sink\" file download manager in the Git repo here: [https://github.com/niusealeo/election-result-BFS-crawler](https://github.com/niusealeo/election-result-BFS-crawler)\n\nTo begin the first collection run, select the \"Runs\" option, choose only \"Discover Links\", upload the urls-level-1.json seed file into the test data, and then run the NZ Elections collection.\n\nA next level urls-level-2.json should have have been issued by the \"Sink\" into a /[BFS_crawl](https://github.com/niusealeo/election-result-BFS-crawler/tree/main/BFS_crawl)/[_meta](https://github.com/niusealeo/election-result-BFS-crawler/tree/main/BFS_crawl/_meta)/[electionresults.govt.nz](https://github.com/niusealeo/election-result-BFS-crawler/tree/main/BFS_crawl/_meta/electionresults.govt.nz)/[artifacts](https://github.com/niusealeo/election-result-BFS-crawler/tree/main/BFS_crawl/_meta/electionresults.govt.nz/artifacts)/ directory. If the static html page returned by the seed url also contained file links with extensions xls, xlsx, csv, txt, pdf, zip, etc. then a files-level-1.json should have been produced (but not in the case of the [https://www.electionresults.govt.nz/](https://www.electionresults.govt.nz/) landing page which doesn't have file urls).\n\nThe collections run can then be manually repeated with each subsequent urls-level-X.json, until satisifed. The BFS collections would eventually return all the urls in the static html of an entire \"closed\" website system.\n\n\"Get Electorate Enumeration\" performs a similar task, but lists the official and alphabetic order of the electorates in each MMP election. [Run these urls](https://github.com/niusealeo/election-result-BFS-crawler/blob/main/BFS_crawl/_meta/electionresults.govt.nz/electorate-map-urls.json) in the test data to get the electorate lists for 1996-2023.\n\nThe lists of files-level-X.json can then also be downloaded into the Sink downloads directory using the same steps with the Postman \"Download Files\" collection runner. All the files are hashed into an index to ensure no identical files are downloaded even if they have different names or have been stored in multiple places on the website.\n\n\"Sink\" organises downloaded files into a domain-scoped folder tree. Election-specific organisation rules are optional. \"Sink\" might be capable of receiving data files from any website, though they would likely be dumped directly into the downloads folder with minimal organisation.\n\nThis BFS Crawler should be used on trusted websites to ensure that safe files are downloaded.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
@@ -180,8 +180,7 @@
               "}, (err, res) => {\r",
               "  if (err) console.log(\"meta upload error\", err);\r",
               "  else console.log(\"meta upload ok\", res.code, termKey);\r",
-              "});\r",
-              ""
+              "});"
             ],
             "type": "text/javascript",
             "packages": {},
@@ -338,7 +337,6 @@
               "  if (!abs) continue;\r",
               "\r",
               "  if (!abs.startsWith(origin)) continue;\r",
-              "  if (isJunkAssetUrl(abs)) continue;\r",
               "\r",
               "  if (isDownloadableFile(abs)) {\r",
               "    const ext = extOf(abs) || \"bin\";\r",
@@ -356,6 +354,7 @@
               "    continue;\r",
               "  }\r",
               "\r",
+              "  if (isJunkAssetUrl(abs)) continue;\r",
               "  if (!pageSet.has(abs)) { pageSet.add(abs); newPages++; }\r",
               "}\r",
               "\r",
@@ -399,8 +398,7 @@
               "  // pm.collectionVariables.unset(\"DISCOVER_fileMap\");\r",
               "  // pm.collectionVariables.unset(\"DISCOVER_level\");\r",
               "  // pm.collectionVariables.unset(\"DISCOVER_kind\");\r",
-              "}\r",
-              "\r"
+              "}"
             ],
             "type": "text/javascript",
             "packages": {},
@@ -431,7 +429,7 @@
               "\r",
               "// Set request URL from iteration data when running in Collection Runner\r",
               "const rowUrl = pm.iterationData.get(\"url\") || pm.variables.get(\"url\");\r",
-              "if (rowUrl) { pm.request.url = rowUrl; }\r"
+              "if (rowUrl) { pm.request.url = rowUrl; }"
             ],
             "type": "text/javascript",
             "packages": {},
@@ -531,13 +529,13 @@
               "  const abs = toAbs(raw);\r",
               "  if (!abs) continue;\r",
               "  if (!abs.startsWith(origin)) continue;\r",
-              "  if (isJunkAssetUrl(abs)) continue;\r",
               "\r",
               "  if (isDownloadableFile(abs)) {\r",
               "    deltaFiles.push({ url: abs, ext: extOf(abs) || \"bin\", source_page_url: currentUrl });\r",
               "  } else {\r",
               "    deltaPages.push({ url: abs });\r",
               "  }\r",
+              "  if (isJunkAssetUrl(abs)) continue;\r",
               "}\r",
               "\r",
               "// Buffer deltas in small batches to avoid spamming the sink\r",
@@ -606,8 +604,7 @@
               "      });\r",
               "    }\r",
               "  });\r",
-              "}\r",
-              "\r"
+              "}"
             ],
             "type": "text/javascript",
             "packages": {},
@@ -660,7 +657,7 @@
               "\r",
               "// Set request URL from iteration data when running in Collection Runner\r",
               "const rowUrl = pm.iterationData.get(\"url\") || pm.variables.get(\"url\");\r",
-              "if (rowUrl) { pm.request.url = rowUrl; }\r"
+              "if (rowUrl) { pm.request.url = rowUrl; }"
             ],
             "type": "text/javascript",
             "packages": {},
@@ -716,8 +713,7 @@
               "\r",
               "    pm.collectionVariables.set(key, JSON.stringify(meta));\r",
               "  }\r",
-              ");\r",
-              ""
+              ");"
             ],
             "type": "text/javascript",
             "packages": {},
@@ -819,8 +815,7 @@
               ");\r",
               "\r",
               "// Cleanup\r",
-              "pm.collectionVariables.unset(headKey);\r",
-              ""
+              "pm.collectionVariables.unset(headKey);"
             ],
             "type": "text/javascript",
             "packages": {},
@@ -904,8 +899,7 @@
               "}, (err, res) => {\r",
               "  if (err) console.log(\"upload/file ERROR\", err);\r",
               "  else console.log(\"upload/file\", res.code, res.text && res.text());\r",
-              "});\r",
-              ""
+              "});"
             ],
             "type": "text/javascript",
             "packages": {},
@@ -937,8 +931,7 @@
               "\r",
               "// Always set the request URL from the row\r",
               "const rowUrl = pm.iterationData.get(\"url\");\r",
-              "if (rowUrl) pm.request.url = rowUrl;\r",
-              ""
+              "if (rowUrl) pm.request.url = rowUrl;"
             ],
             "type": "text/javascript",
             "packages": {},

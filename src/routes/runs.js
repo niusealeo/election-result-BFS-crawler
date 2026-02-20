@@ -11,6 +11,7 @@ const { stableUniqUrls, extFromUrl } = require("../lib/urlnorm");
 const { mergeFilesPreferSource } = require("../lib/dedupe");
 const { loadState, saveState, computeSeenUpTo } = require("../lib/state");
 const { writeUrlArtifact, writeFileArtifact, writeUrlsForLevel, writeChunkedUrls } = require("../lib/artifacts");
+const { logEvent } = require("../lib/logger");
 
 const readline = require("readline");
 
@@ -156,6 +157,14 @@ async function finalizeDiscoveryRun({ baseCfg, cfg, level, run_id, jsonlPath }) 
   const nextUrlsPath = path.join(cfg.ARTIFACT_DIR, `urls-level-${nextLevel}.json`);
   const filesPath = path.join(cfg.ARTIFACT_DIR, `files-level-${level}.json`);
 
+  logEvent("FINALIZE_BEGIN", {
+    mode: "streaming",
+    domain_key: cfg.domain_key,
+    level,
+    run_id,
+    jsonl: p,
+  });
+
   writeUrlArtifact({ path: nextUrlsPath, urls: nextPages, nextLevel, metaFirstRow: cfg.ARTIFACT_META_FIRST_ROW });
   writeFileArtifact({ path: filesPath, files: filesForArtifact, level, metaFirstRow: cfg.ARTIFACT_META_FIRST_ROW });
 
@@ -215,6 +224,20 @@ async function finalizeDiscoveryRun({ baseCfg, cfg, level, run_id, jsonlPath }) 
   });
 
   markRunDone(p, { level, run_id, domain_key: cfg.domain_key, wrote: { next_urls: nextUrlsPath, files: filesPath } });
+
+  logEvent("FINALIZE_DONE", {
+    mode: "streaming",
+    domain_key: cfg.domain_key,
+    level,
+    run_id,
+    visited: visited.length,
+    pages: pages.length,
+    next_pages: nextPages.length,
+    files_out: filesForArtifact.length,
+    remaining: remaining.length,
+    wrote_next_urls: nextUrlsPath,
+    wrote_files: filesPath,
+  });
 
   return {
     ok: true,
@@ -288,6 +311,12 @@ function makeRunsRouter(baseCfg) {
           run_id,
           action: "start",
         });
+        logEvent("RUN_START_URLS", {
+          domain_key: cfg.domain_key,
+          level,
+          run_id,
+          jsonl: p,
+        });
         return res.json({ ok: true, level, run_id, path: p });
       });
     } catch (e) {
@@ -328,6 +357,15 @@ function makeRunsRouter(baseCfg) {
       return await withLock(() => {
         const p = runJsonlPath(cfg, level, run_id);
         appendJsonl(p, payload);
+        logEvent("RUN_APPEND_URLS", {
+          domain_key: cfg.domain_key,
+          level,
+          run_id,
+          appended_visited: payload.visited.length,
+          appended_pages: payload.pages.length,
+          appended_files: payload.files.length,
+          jsonl: p,
+        });
         return res.json({ ok: true, level, run_id, appended: {
           visited: payload.visited.length,
           pages: payload.pages.length,
@@ -377,6 +415,15 @@ function makeRunsRouter(baseCfg) {
         }
 
         const result = await finalizeDiscoveryRun({ baseCfg, cfg, level, run_id, jsonlPath: p });
+        logEvent("RUN_FINALIZE_URLS", {
+          domain_key: cfg.domain_key,
+          level,
+          run_id,
+          visited: result?.visited,
+          next_pages: result?.next_pages,
+          files: result?.files,
+          remaining: result?.remaining,
+        });
         return res.json(result);
       });
     } catch (e) {
@@ -400,6 +447,14 @@ function makeRunsRouter(baseCfg) {
       const arr = readJsonSafe(inPath, []);
       const urls = Array.isArray(arr) ? arr.map((r) => (typeof r === "string" ? r : r?.url)).filter(Boolean) : [];
       const info = writeChunkedUrls({ basePath: inPath, urls: stableUniqUrls(urls), level, metaFirstRow: cfg.ARTIFACT_META_FIRST_ROW, chunkSize });
+      logEvent("CHUNK_URLS", {
+        domain_key: cfg.domain_key,
+        level,
+        chunk_size: chunkSize,
+        total: urls.length,
+        parts: info?.chunk_files?.length,
+        manifest: info?.manifest_path,
+      });
       return res.json({ ok: true, level, chunk_size: chunkSize, total: urls.length, wrote: info });
     } catch (e) {
       return res.status(500).json({ ok: false, error: String(e?.message || e) });

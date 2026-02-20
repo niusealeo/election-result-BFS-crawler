@@ -190,8 +190,7 @@ Environment variables:
 - `AUTO_FINALIZE_INTERVAL_MS=60000` (default 1 minute).
 
 This repo ships both Postman collection files so you can choose per run:
-- `NZ Elections.postman_collection.legacy.json`
-- `NZ Elections.postman_collection.streaming.json` (also copied as `NZ Elections.postman_collection.json`)
+- `NZ Elections.postman_collection.json` (contains *both* Step 1 variants: legacy and streaming discovery)
 
 Sink supports **both** modes simultaneously.
 

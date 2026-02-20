@@ -3,6 +3,7 @@ const path = require("path");
 
 const { withLock } = require("./lock");
 const { domainCfg, ensureDomainFolders } = require("./domain");
+const { logEvent } = require("./logger");
 
 // Streaming discovery run buckets are stored as JSONL files in:
 //   BFS_crawl/runs/<domainKey>/discover_level_<level>_<runId>.jsonl
@@ -31,7 +32,7 @@ async function startAutoFinalize({ baseCfg, finalizeDiscoveryRun }) {
   const intervalMs = Math.max(5000, Number(baseCfg.AUTO_FINALIZE_INTERVAL_MS || 60000));
   const idleMs = Math.max(10000, Number(baseCfg.AUTO_FINALIZE_IDLE_MS || 180000));
 
-  console.log(`[auto-finalize] enabled. interval=${intervalMs}ms idle=${idleMs}ms`);
+  logEvent("AUTO_FINALIZE_ENABLED", { interval_ms: intervalMs, idle_ms: idleMs });
 
   setInterval(() => {
     // Never overlap scans.
@@ -70,17 +71,34 @@ async function startAutoFinalize({ baseCfg, finalizeDiscoveryRun }) {
             const cfg = domainCfg(baseCfg, domainKey);
             ensureDomainFolders(cfg);
 
-            console.log(`[auto-finalize] idle run detected: domain=${domainKey} level=${parsed.level} run_id=${parsed.run_id} size=${st.size} age_ms=${Math.round(age)}`);
+            logEvent("AUTO_FINALIZE_TRIGGER", {
+              domain_key: domainKey,
+              level: parsed.level,
+              run_id: parsed.run_id,
+              size_bytes: st.size,
+              age_ms: Math.round(age),
+              jsonl: jsonlPath,
+            });
 
             const result = await finalizeDiscoveryRun({ baseCfg, cfg, level: parsed.level, run_id: parsed.run_id, jsonlPath });
             // Mark as done even if finalize had nothing new; prevents repeated rescans.
             try {
               fs.writeFileSync(donePath, JSON.stringify({ ts: new Date().toISOString(), ...result }, null, 2), { encoding: "utf-8" });
             } catch {}
+
+            logEvent("AUTO_FINALIZE_DONE", {
+              domain_key: domainKey,
+              level: parsed.level,
+              run_id: parsed.run_id,
+              visited: result?.visited,
+              next_pages: result?.next_pages,
+              files: result?.files,
+              remaining: result?.remaining,
+            });
           }
         }
       } catch (e) {
-        console.log(`[auto-finalize] scan error: ${String(e?.message || e)}`);
+        logEvent("AUTO_FINALIZE_ERROR", { error: String(e?.message || e) });
       }
     });
   }, intervalMs);

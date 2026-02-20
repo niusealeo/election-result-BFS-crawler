@@ -7,6 +7,7 @@ const { loadState, saveState, computeSeenUpTo } = require("../lib/state");
 const { appendJsonl } = require("../lib/jsonl");
 const { writeUrlArtifact, writeFileArtifact, writeRowListArtifact } = require("../lib/artifacts");
 const { cfgForReq } = require("../lib/domain");
+const { logEvent } = require("../lib/logger");
 
 function readUrlArtifactList(p) {
   const raw = readJsonSafe(p, null);
@@ -192,6 +193,20 @@ function makeDedupeRouter(baseCfg) {
 
       writeUrlArtifact({ path: nextUrlsPath, urls: nextPages, nextLevel, metaFirstRow: cfg.ARTIFACT_META_FIRST_ROW });
       writeFileArtifact({ path: filesPath, files: filesForArtifact, level, metaFirstRow: cfg.ARTIFACT_META_FIRST_ROW });
+
+      logEvent("DEDUPE_LEVEL", {
+        mode: "legacy",
+        domain_key: cfg.domain_key,
+        level,
+        next_level: nextLevel,
+        visited: visited.length,
+        pages_in: pages.length,
+        next_pages: nextPages.length,
+        files_out: filesForArtifact.length,
+        update: doUpdateDiff ? true : false,
+        wrote_next_urls: nextUrlsPath,
+        wrote_files: filesPath,
+      });
 
       appendJsonl(cfg.LOG_DEDUPE, {
         ts: new Date().toISOString(),

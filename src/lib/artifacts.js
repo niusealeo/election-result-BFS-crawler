@@ -100,6 +100,41 @@ function writeFileArtifact({ path, files, level, metaFirstRow }) {
   return writeJson(path, [{ _meta: true, level, kind: "files", ...first }, ...rest]);
 }
 
+// Write a files artifact for an explicit level.
+function writeFilesForLevel({ path, files, level, metaFirstRow }) {
+  return writeFileArtifact({ path, files, level, metaFirstRow });
+}
+
+// Write chunked variants of a files artifact, and a small manifest.
+function writeChunkedFiles({ basePath, files, level, metaFirstRow, chunkSize }) {
+  if (!files || files.length === 0) {
+    return { chunk_files: [], manifest_path: null };
+  }
+
+  const chunks = chunkArray(files, chunkSize);
+  const chunk_files = [];
+  for (let i = 0; i < chunks.length; i++) {
+    const p = makeChunkFileName(basePath, i + 1, chunks.length);
+    writeFilesForLevel({ path: p, files: chunks[i], level, metaFirstRow });
+    chunk_files.push(p);
+  }
+
+  const manifest_path = `${String(basePath).replace(/\.json$/i, "")}.parts.json`;
+  writeJson(manifest_path, {
+    kind: "files",
+    level,
+    chunk_size: Math.max(1, Number(chunkSize) || 1),
+    total: files.length,
+    parts: chunk_files.map((p, idx) => ({
+      index: idx + 1,
+      path: p,
+      count: chunks[idx].length,
+    })),
+  });
+
+  return { chunk_files, manifest_path };
+}
+
 /**
  * Write a flat list of rows for Postman Runner (diffs, probes, etc).
  * When metaFirstRow is true, the first array element is a conflated meta+row object.
@@ -124,4 +159,6 @@ module.exports = {
   writeRowListArtifact,
   writeUrlsForLevel,
   writeChunkedUrls,
+  writeFilesForLevel,
+  writeChunkedFiles,
 };

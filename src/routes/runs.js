@@ -12,6 +12,7 @@ const { mergeFilesPreferSource } = require("../lib/dedupe");
 const { loadState, saveState, computeSeenUpTo } = require("../lib/state");
 const { writeUrlArtifact, writeFileArtifact, writeUrlsForLevel, writeChunkedUrls } = require("../lib/artifacts");
 const { logEvent } = require("../lib/logger");
+const { listDomainKeys, listFileLevels, reconcileFilesLevel } = require("../lib/reconcile_files");
 
 const readline = require("readline");
 
@@ -555,6 +556,92 @@ function makeRunsRouter(baseCfg) {
         removedLevelRefs,
         deletedHashes,
       });
+      });
+    } catch (e) {
+      return res.status(500).json({ ok: false, error: String(e?.message || e) });
+    }
+  });
+
+  // ---------------------------------------------------------------------
+  // Files reconciliation + chunking (Option A)
+  // ---------------------------------------------------------------------
+  // POST /runs/chunk/files
+  // Body: { level: number, domain?: string, chunk_size?: number }
+  // If domain is provided, only that domain is reconciled.
+  // If domain is omitted, all domains are swept for that level.
+  r.post("/runs/chunk/files", async (req, res) => {
+    try {
+      const level = Number(req.body?.level);
+      if (!Number.isFinite(level) || level < 1) {
+        return res.status(400).json({ ok: false, error: "Invalid level" });
+      }
+      const chunkSize = Number(req.body?.chunk_size || baseCfg.ARTIFACT_CHUNK_SIZE || 6169);
+
+      const domain = req.body?.domain ? String(req.body.domain) : null;
+      const domains = domain ? [domain] : listDomainKeys(baseCfg);
+      const results = [];
+
+      return await withLock(() => {
+        for (const dk of domains) {
+          const cfg = domainCfg(baseCfg, dk);
+          ensureDomainFolders(cfg);
+
+          // Only reconcile if the expected artifact exists.
+          const expectedPath = path.join(cfg.ARTIFACT_DIR, `files-level-${level}.json`);
+          if (!fs.existsSync(expectedPath)) {
+            results.push({ domain_key: cfg.domain_key, level, ok: false, status: "MISSING_EXPECTED", expected_path: expectedPath });
+            continue;
+          }
+
+          const r1 = reconcileFilesLevel({ cfg, level, chunkSize });
+          // Print reconciliation result to console (with timestamps)
+          console.log(`[${new Date().toISOString()}] [RECONCILE files] domain=${cfg.domain_key} level=${level}`);
+          console.log(`  expected:   ${r1.expected}`);
+          console.log(`  downloaded: ${r1.downloaded}`);
+          console.log(`  remaining:  ${r1.remaining}`);
+          console.log(`  chunk_size: ${r1.chunk_size}`);
+          console.log(`  parts:      ${Array.isArray(r1.wrote?.parts) ? r1.wrote.parts.length : 0}`);
+          console.log(`  status:     ${r1.status}`);
+          results.push({ ok: true, ...r1 });
+        }
+        return res.json({ ok: true, level, chunk_size: chunkSize, results });
+      });
+    } catch (e) {
+      return res.status(500).json({ ok: false, error: String(e?.message || e) });
+    }
+  });
+
+  // POST /runs/chunk/files/incomplete
+  // Body: { domain?: string, chunk_size?: number }
+  // Sweeps all domains (or one domain) and reconciles all *incomplete* file levels.
+  r.post("/runs/chunk/files/incomplete", async (req, res) => {
+    try {
+      const chunkSize = Number(req.body?.chunk_size || baseCfg.ARTIFACT_CHUNK_SIZE || 6169);
+      const domain = req.body?.domain ? String(req.body.domain) : null;
+      const domains = domain ? [domain] : listDomainKeys(baseCfg);
+      const results = [];
+
+      return await withLock(() => {
+        for (const dk of domains) {
+          const cfg = domainCfg(baseCfg, dk);
+          ensureDomainFolders(cfg);
+          const levels = listFileLevels(cfg);
+          for (const level of levels) {
+            const r1 = reconcileFilesLevel({ cfg, level, chunkSize });
+            // Only keep results where incomplete.
+            if (r1.remaining > 0) {
+              console.log(`[${new Date().toISOString()}] [RECONCILE files/incomplete] domain=${cfg.domain_key} level=${level}`);
+              console.log(`  expected:   ${r1.expected}`);
+              console.log(`  downloaded: ${r1.downloaded}`);
+              console.log(`  remaining:  ${r1.remaining}`);
+              console.log(`  chunk_size: ${r1.chunk_size}`);
+              console.log(`  parts:      ${Array.isArray(r1.wrote?.parts) ? r1.wrote.parts.length : 0}`);
+              console.log(`  status:     ${r1.status}`);
+              results.push({ ok: true, ...r1 });
+            }
+          }
+        }
+        return res.json({ ok: true, chunk_size: chunkSize, results, incomplete_count: results.length });
       });
     } catch (e) {
       return res.status(500).json({ ok: false, error: String(e?.message || e) });

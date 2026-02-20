@@ -11,6 +11,8 @@ const { makeRunsRouter, finalizeDiscoveryRun } = require("./routes/runs");
 const { makeProbeRouter } = require("./routes/probe");
 const { resortDownloads } = require("./lib/resort");
 const { startAutoFinalize } = require("./lib/autofinalize");
+const { requestLogger } = require("./lib/logger");
+const { listDomainKeys, listFileLevels, computeFilesLevelStatus } = require("./lib/reconcile_files");
 
 function ensureFolders() {
   // Ensure root folders exist (domain-scoped subfolders are created on demand)
@@ -42,6 +44,10 @@ async function runServer() {
   const app = express();
   app.use(express.json({ limit: "750mb" }));
 
+  // Basic request logger (timestamped). Safe, low overhead.
+  // If you already have your own logger, you can remove this line.
+  app.use(requestLogger());
+
   app.use(makeHealthRouter(baseCfg));
   app.use(makeDedupeRouter(baseCfg));
   app.use(makeUploadRouter(baseCfg));
@@ -53,6 +59,39 @@ async function runServer() {
   startAutoFinalize({ baseCfg, finalizeDiscoveryRun }).catch((e) => {
     console.log(`[auto-finalize] failed to start: ${String(e?.message || e)}`);
   });
+
+  // Startup reconciliation report (report-only; does not write artifacts)
+  try {
+    console.log(`[${new Date().toISOString()}] [STARTUP RECONCILIATION REPORT]`);
+    const domains = listDomainKeys(baseCfg);
+    let incomplete = 0;
+    for (const dk of domains) {
+      const cfg = domainCfg(baseCfg, dk);
+      ensureDomainFolders(cfg);
+      const levels = listFileLevels(cfg);
+      if (!levels.length) continue;
+      let printedDomain = false;
+      for (const level of levels) {
+        const st = computeFilesLevelStatus({ cfg, level });
+        if (st.status === "INCOMPLETE") {
+          if (!printedDomain) {
+            console.log(`\n${cfg.domain_key}`);
+            printedDomain = true;
+          }
+          console.log(`  files level ${level}: ${st.downloaded} / ${st.expected} (remaining ${st.remaining})`);
+          incomplete++;
+        }
+      }
+    }
+    if (!domains.length) {
+      console.log(`  (no domains under META_ROOT)`);
+    } else {
+      console.log(`  (use POST /runs/chunk/files or /runs/chunk/files/incomplete to generate remaining parts)`);
+    }
+    console.log(`[${new Date().toISOString()}] [STARTUP RECONCILIATION REPORT] done. incomplete=${incomplete}`);
+  } catch (e) {
+    console.log(`[${new Date().toISOString()}] [STARTUP RECONCILIATION REPORT] failed: ${String(e?.message || e)}`);
+  }
 
   app.listen(baseCfg.PORT, () => {
     console.log(`sink listening on http://localhost:${baseCfg.PORT}`);

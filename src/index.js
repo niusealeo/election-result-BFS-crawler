@@ -11,7 +11,7 @@ const { makeRunsRouter, finalizeDiscoveryRun } = require("./routes/runs");
 const { makeProbeRouter } = require("./routes/probe");
 const { resortDownloads } = require("./lib/resort");
 const { startAutoFinalize } = require("./lib/autofinalize");
-const { requestLogger } = require("./lib/logger");
+// const { requestLogger } = require("./lib/logger");
 const { listDomainKeys, listFileLevels, computeFilesLevelStatus } = require("./lib/reconcile_files");
 
 function ensureFolders() {
@@ -46,7 +46,7 @@ async function runServer() {
 
   // Basic request logger (timestamped). Safe, low overhead.
   // If you already have your own logger, you can remove this line.
-  app.use(requestLogger());
+  // app.use(requestLogger());
 
   app.use(makeHealthRouter(baseCfg));
   app.use(makeDedupeRouter(baseCfg));

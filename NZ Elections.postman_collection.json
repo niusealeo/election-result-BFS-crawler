@@ -283,8 +283,15 @@
               "  );\r",
               "}\r",
               "\r",
+              "function normalizeUrl(u) {\r",
+              "  if (!u) return u;\r",
+              "  // Fix common HTML-entity leakage in query strings (&amp;... or repeated amp;)\r",
+              "  let cleaned = String(u).replace(/amp;/g, \"\");\r",
+              "  try { return new URL(cleaned).toString(); } catch { return cleaned; }\r",
+              "}\r",
+              "\r",
               "function toAbs(href) {\r",
-              "  try { return new URL(href, currentUrl).toString(); } catch { return null; }\r",
+              "  try { return normalizeUrl(new URL(href, currentUrl).toString()); } catch { return null; }\r",
               "}\r",
               "\r",
               "function isJunkAssetUrl(u) {\r",
@@ -393,7 +400,7 @@
               "  // pm.collectionVariables.unset(\"DISCOVER_level\");\r",
               "  // pm.collectionVariables.unset(\"DISCOVER_kind\");\r",
               "}\r",
-              ""
+              "\r"
             ],
             "type": "text/javascript",
             "packages": {},
@@ -419,7 +426,12 @@
               "\r",
               "  console.log(\"DISCOVER init/reset for level\", lvl);\r",
               "}\r",
-              ""
+              "\r",
+              "\r",
+              "\r",
+              "// Set request URL from iteration data when running in Collection Runner\r",
+              "const rowUrl = pm.iterationData.get(\"url\") || pm.variables.get(\"url\");\r",
+              "if (rowUrl) { pm.request.url = rowUrl; }\r"
             ],
             "type": "text/javascript",
             "packages": {},
@@ -431,10 +443,7 @@
         "method": "GET",
         "header": [],
         "url": {
-          "raw": "{{url}}",
-          "host": [
-            "{{url}}"
-          ]
+          "raw": "{{url}}"
         }
       },
       "response": []
@@ -485,8 +494,15 @@
               "    h.startsWith(\"tel:\")\r",
               "  );\r",
               "}\r",
+              "function normalizeUrl(u) {\r",
+              "  if (!u) return u;\r",
+              "  // Fix common HTML-entity leakage in query strings (&amp;... or repeated amp;)\r",
+              "  let cleaned = String(u).replace(/amp;/g, \"\");\r",
+              "  try { return new URL(cleaned).toString(); } catch { return cleaned; }\r",
+              "}\r",
+              "\r",
               "function toAbs(href) {\r",
-              "  try { return new URL(href, currentUrl).toString(); } catch { return null; }\r",
+              "  try { return normalizeUrl(new URL(href, currentUrl).toString()); } catch { return null; }\r",
               "}\r",
               "function isJunkAssetUrl(u) {\r",
               "  return /\\.(css|js|mjs|map|png|jpg|jpeg|gif|webp|svg|ico|woff2?|ttf|eot|otf)(\\?|#|$)/i.test(u) ||\r",
@@ -591,7 +607,7 @@
               "    }\r",
               "  });\r",
               "}\r",
-              ""
+              "\r"
             ],
             "type": "text/javascript",
             "packages": {},
@@ -639,7 +655,12 @@
               "\r",
               "  console.log(\"DISCOVER streaming init for level\", lvl, \"run\", runId);\r",
               "}\r",
-              ""
+              "\r",
+              "\r",
+              "\r",
+              "// Set request URL from iteration data when running in Collection Runner\r",
+              "const rowUrl = pm.iterationData.get(\"url\") || pm.variables.get(\"url\");\r",
+              "if (rowUrl) { pm.request.url = rowUrl; }\r"
             ],
             "type": "text/javascript",
             "packages": {},
@@ -651,10 +672,7 @@
         "method": "GET",
         "header": [],
         "url": {
-          "raw": "{{url}}",
-          "host": [
-            "{{url}}"
-          ]
+          "raw": "{{url}}"
         }
       },
       "response": []

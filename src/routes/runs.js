@@ -127,7 +127,7 @@ async function readDiscoveryJsonl(p) {
 
 // Finalize helper used by both HTTP endpoint and the auto-finalize watchdog.
 // IMPORTANT: Caller should hold withLock() if needed.
-async function finalizeDiscoveryRun({ baseCfg, cfg, level, run_id, jsonlPath }) {
+async function finalizeDiscoveryRun({ baseCfg, cfg, level, run_id, jsonlPath, replace = false }) {
   ensureDomainFolders(cfg);
 
   const p = jsonlPath || runJsonlPath(cfg, level, run_id);
@@ -139,14 +139,35 @@ async function finalizeDiscoveryRun({ baseCfg, cfg, level, run_id, jsonlPath }) 
   const filesMerged = mergeFilesPreferSource(inFiles);
 
   const st = loadState(cfg.STATE_PATH);
-  st.levels[String(level)] = { visited, pages, files: filesMerged };
+
+  // -------------------------------------------------------------------
+  // IMPORTANT: Accumulate partial runs
+  // -------------------------------------------------------------------
+  // Large levels are frequently processed in multiple "parts" (separate
+  // Postman runner invocations, often with different run_id values).
+  // Previously, every finalize overwrote st.levels[level], which meant the
+  // next-level artifacts only reflected the most recently finalized part.
+  //
+  // Default behaviour now: MERGE (accumulate) into existing level state.
+  // To force replacement, callers may pass { replace: true }.
+  replace = Boolean(replace);
+  const prev = (!replace && st.levels[String(level)]) ? st.levels[String(level)] : null;
+  const prevVisited = Array.isArray(prev?.visited) ? prev.visited : [];
+  const prevPages = Array.isArray(prev?.pages) ? prev.pages : [];
+  const prevFiles = Array.isArray(prev?.files) ? prev.files : [];
+
+  const visitedMerged = prev ? stableUniqUrls([...prevVisited, ...visited]) : visited;
+  const pagesMerged = prev ? stableUniqUrls([...prevPages, ...pages]) : pages;
+  const filesMergedAll = prev ? mergeFilesPreferSource([...prevFiles, ...filesMerged]) : filesMerged;
+
+  st.levels[String(level)] = { visited: visitedMerged, pages: pagesMerged, files: filesMergedAll };
   saveState(cfg.STATE_PATH, st);
 
   const { seenPages: seenPagesBefore, seenFiles: seenFilesBefore } = computeSeenUpTo(st, level - 1);
-  const seenForNextPages = new Set([...seenPagesBefore, ...visited]);
+  const seenForNextPages = new Set([...seenPagesBefore, ...visitedMerged]);
 
-  const nextPages = pages.filter((u) => !seenForNextPages.has(u));
-  const filesOut = filesMerged.filter((f) => !seenFilesBefore.has(f.url));
+  const nextPages = pagesMerged.filter((u) => !seenForNextPages.has(u));
+  const filesOut = filesMergedAll.filter((f) => !seenFilesBefore.has(f.url));
 
   const filesForArtifact = filesOut.map((f) => ({
     url: f.url,
@@ -197,7 +218,7 @@ async function finalizeDiscoveryRun({ baseCfg, cfg, level, run_id, jsonlPath }) 
 
   // If input artifact isn't available (rare), we can still create remaining
   // by treating the discovered 'visited' set as the whole input.
-  const visitedSet = new Set(visited);
+  const visitedSet = new Set(visitedMerged);
   const remaining = (inputUrls && inputUrls.length)
     ? stableUniqUrls(inputUrls).filter((u) => !visitedSet.has(u))
     : [];
@@ -415,7 +436,7 @@ function makeRunsRouter(baseCfg) {
           if (found?.path && fs.existsSync(found.path)) p = found.path;
         }
 
-        const result = await finalizeDiscoveryRun({ baseCfg, cfg, level, run_id, jsonlPath: p });
+        const result = await finalizeDiscoveryRun({ baseCfg, cfg, level, run_id, jsonlPath: p, replace: Boolean(req.body?.replace) });
         logEvent("RUN_FINALIZE_URLS", {
           domain_key: cfg.domain_key,
           level,

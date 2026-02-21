@@ -68,14 +68,26 @@ function makeDedupeRouter(baseCfg) {
       const filesMerged = mergeFilesPreferSource(inFiles);
 
       const st = loadState(cfg.STATE_PATH);
-      st.levels[String(level)] = { visited, pages, files: filesMerged };
+
+      // Accumulate partial runs by default. To force replacement, pass { replace: true }.
+      const replace = Boolean(req.body?.replace);
+      const prev = (!replace && st.levels[String(level)]) ? st.levels[String(level)] : null;
+      const prevVisited = Array.isArray(prev?.visited) ? prev.visited : [];
+      const prevPages = Array.isArray(prev?.pages) ? prev.pages : [];
+      const prevFiles = Array.isArray(prev?.files) ? prev.files : [];
+
+      const visitedMerged = prev ? stableUniqUrls([...prevVisited, ...visited]) : visited;
+      const pagesMerged = prev ? stableUniqUrls([...prevPages, ...pages]) : pages;
+      const filesMergedAll = prev ? mergeFilesPreferSource([...prevFiles, ...filesMerged]) : filesMerged;
+
+      st.levels[String(level)] = { visited: visitedMerged, pages: pagesMerged, files: filesMergedAll };
       saveState(cfg.STATE_PATH, st);
 
       const { seenPages: seenPagesBefore, seenFiles: seenFilesBefore } = computeSeenUpTo(st, level - 1);
-      const seenForNextPages = new Set([...seenPagesBefore, ...visited]);
+      const seenForNextPages = new Set([...seenPagesBefore, ...visitedMerged]);
 
-      const nextPages = pages.filter((u) => !seenForNextPages.has(u));
-      const filesOut = filesMerged.filter((f) => !seenFilesBefore.has(f.url));
+      const nextPages = pagesMerged.filter((u) => !seenForNextPages.has(u));
+      const filesOut = filesMergedAll.filter((f) => !seenFilesBefore.has(f.url));
 
       const filesForArtifact = filesOut.map((f) => ({
         url: f.url,
@@ -89,9 +101,33 @@ function makeDedupeRouter(baseCfg) {
 
       // Optional incremental "update" mode:
       // - Diff newly produced artifacts against the existing artifacts on disk
-      // - Overwrite artifacts (thereby pruning URLs/files that no longer exist)
-      // - Emit diff files that list added/removed URLs/files
-      const doUpdateDiff = Boolean(req.body?.update || req.body?.mode === "update");
+      // - By default, PATCH (incrementally apply) the existing artifacts on disk.
+      //   This prevents partial reruns (e.g. level parts) from overwriting prior results.
+      // - If you want full overwrite/prune semantics, pass { full: true }.
+      // - If you want removals applied during patching, pass { prune: true }.
+      // - Diff artifacts are still emitted (added + removed).
+      // --------------------------------------------------------------
+      // Update/diff mode (DEFAULT ON)
+      // --------------------------------------------------------------
+      // Historically this endpoint overwrote urls-level-(L+1).json and
+      // files-level-L.json each time it was called. For part-based BFS
+      // (running urls-level-L.part-XXXX in multiple Postman runs), that
+      // behaviour is destructive.
+      //
+      // We now enable update/diff mode by default so repeated calls are
+      // incremental and audit-friendly.
+      //
+      // Disable diffs/patching and do a plain rewrite with:
+      //   { update: false }
+      //
+      // Force a full overwrite (while still emitting diffs) with:
+      //   { full: true }
+      //
+      const doUpdateDiff = req.body?.update === false ? false : true;
+
+      // Default: incremental patching when update/diff is enabled.
+      const patchArtifacts = doUpdateDiff && !Boolean(req.body?.full);
+      const pruneDuringPatch = Boolean(req.body?.prune);
 
       let urlsDiffPath = null;
       let filesDiffPath = null;
@@ -101,6 +137,10 @@ function makeDedupeRouter(baseCfg) {
       let urls_removed = 0;
       let files_added = 0;
       let files_removed = 0;
+
+      // Final artifacts we will write.
+      let finalNextPages = nextPages;
+      let finalFilesForArtifact = filesForArtifact;
 
       if (doUpdateDiff) {
         ensureDir(cfg.ARTIFACT_DIR);
@@ -189,10 +229,49 @@ function makeDedupeRouter(baseCfg) {
           level,
           metaFirstRow: cfg.ARTIFACT_META_FIRST_ROW,
         });
+
+        // Incrementally patch the main artifacts (default behavior).
+        // - Add newly discovered URLs/files
+        // - Optionally apply removals when pruneDuringPatch=true
+        if (patchArtifacts) {
+          // URLs are stored as strings in artifacts.
+          const addedUrlStrings = addedUrls
+            .map((u) => (typeof u === "string" ? u : u?.url))
+            .filter(Boolean);
+
+          let patchedUrls = stableUniqUrls([...(oldUrls || []), ...addedUrlStrings]);
+          if (pruneDuringPatch) {
+            const removedSet = new Set(
+              removedUrls
+                .map((u) => (typeof u === "string" ? u : u?.url))
+                .filter(Boolean)
+            );
+            patchedUrls = patchedUrls.filter((u) => !removedSet.has(u));
+          }
+          finalNextPages = patchedUrls;
+
+          // Files are stored as objects in artifacts.
+          const addedFileObjs = addedFiles
+            .map((f) => (typeof f === "string" ? { url: f } : f))
+            .filter((f) => f && f.url);
+          const oldFileObjs = (oldFiles || []).map((f) => (typeof f === "string" ? { url: f } : f));
+
+          let patchedFiles = mergeFilesPreferSource([...oldFileObjs, ...addedFileObjs]);
+          if (pruneDuringPatch) {
+            const removedFileSet = new Set((removedFiles || []).map((f) => f?.url).filter(Boolean));
+            patchedFiles = patchedFiles.filter((f) => !removedFileSet.has(f.url));
+          }
+
+          finalFilesForArtifact = patchedFiles.map((f) => ({
+            url: f.url,
+            ext: (f.ext || extFromUrl(f.url) || "bin").toLowerCase(),
+            source_page_url: f.source_page_url || null,
+          }));
+        }
       }
 
-      writeUrlArtifact({ path: nextUrlsPath, urls: nextPages, nextLevel, metaFirstRow: cfg.ARTIFACT_META_FIRST_ROW });
-      writeFileArtifact({ path: filesPath, files: filesForArtifact, level, metaFirstRow: cfg.ARTIFACT_META_FIRST_ROW });
+      writeUrlArtifact({ path: nextUrlsPath, urls: finalNextPages, nextLevel, metaFirstRow: cfg.ARTIFACT_META_FIRST_ROW });
+      writeFileArtifact({ path: filesPath, files: finalFilesForArtifact, level, metaFirstRow: cfg.ARTIFACT_META_FIRST_ROW });
 
       logEvent("DEDUPE_LEVEL", {
         mode: "legacy",
@@ -201,8 +280,8 @@ function makeDedupeRouter(baseCfg) {
         next_level: nextLevel,
         visited: visited.length,
         pages_in: pages.length,
-        next_pages: nextPages.length,
-        files_out: filesForArtifact.length,
+        next_pages: finalNextPages.length,
+        files_out: finalFilesForArtifact.length,
         update: doUpdateDiff ? true : false,
         wrote_next_urls: nextUrlsPath,
         wrote_files: filesPath,
@@ -214,7 +293,7 @@ function makeDedupeRouter(baseCfg) {
         update: doUpdateDiff ? true : false,
         visited: visited.length,
         pages_in: pages.length,
-        pages_out_next: nextPages.length,
+        pages_out_next: finalNextPages.length,
         files_in: inFiles.length,
         files_merged: filesMerged.length,
         files_out: filesOut.length,
@@ -228,9 +307,9 @@ function makeDedupeRouter(baseCfg) {
         ok: true,
         level,
         next_level: nextLevel,
-        wrote_next_urls: nextPages.length,
+        wrote_next_urls: finalNextPages.length,
         wrote_files: filesOut.length,
-        next_urls_path: nextPages.length ? nextUrlsPath : null,
+        next_urls_path: finalNextPages.length ? nextUrlsPath : null,
         files_path: filesOut.length ? filesPath : null,
         update: doUpdateDiff
           ? {
@@ -242,6 +321,8 @@ function makeDedupeRouter(baseCfg) {
               files_diff_path: filesDiffPath,
               urls_removed_path: urlsRemovedPathOut,
               files_removed_path: filesRemovedPathOut,
+              patched: patchArtifacts ? true : false,
+              pruned: patchArtifacts && pruneDuringPatch ? true : false,
             }
           : null,
       });

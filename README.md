@@ -7,7 +7,7 @@ The main branch of this repo has since evolved into a more generic purpose semi-
 
 This “sink” is a small local Node/Express API that exists purely in tandem with a Postman Collection Runner workflow.
 
-Link to Postman collections runner workspace here: https://www.postman.com/willscire/bfs-election-crawler/collection/2650823-fed29af4-fd55-499b-b123-624e5fc80c03
+Link to Postman collections runner workspace here: https://www.postman.com/willscire/workspace/bfs-election-crawler/collection/2650823-27c38a69-057c-4edc-9147-296b9596bf42
 
 Think of it like:
 Postman = crawler client  

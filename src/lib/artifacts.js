@@ -32,7 +32,12 @@ function writeUrlArtifact({ path, urls, nextLevel, metaFirstRow }) {
 
   const first = urls[0];
   const rest = urls.slice(1);
-  return writeJson(path, [{ _meta: true, level: nextLevel, kind: "urls", url: first }, ...rest.map((url) => ({ url }))]);
+  // Include total_entries in the meta row so downstream tooling can validate completeness
+  // without scanning the whole file.
+  return writeJson(path, [
+    { _meta: true, level: nextLevel, kind: "urls", total_entries: urls.length, url: first },
+    ...rest.map((url) => ({ url })),
+  ]);
 }
 
 // Write a urls artifact for an explicit level (not necessarily nextLevel).
@@ -45,7 +50,10 @@ function writeUrlsForLevel({ path, urls, level, metaFirstRow }) {
 
   const first = urls[0];
   const rest = urls.slice(1);
-  return writeJson(path, [{ _meta: true, level, kind: "urls", url: first }, ...rest.map((url) => ({ url }))]);
+  return writeJson(path, [
+    { _meta: true, level, kind: "urls", total_entries: urls.length, url: first },
+    ...rest.map((url) => ({ url })),
+  ]);
 }
 
 // Write chunked variants of a urls artifact, and a small manifest.
@@ -97,7 +105,7 @@ function writeFileArtifact({ path, files, level, metaFirstRow }) {
 
   const first = files[0];
   const rest = files.slice(1);
-  return writeJson(path, [{ _meta: true, level, kind: "files", ...first }, ...rest]);
+  return writeJson(path, [{ _meta: true, level, kind: "files", total_entries: files.length, ...first }, ...rest]);
 }
 
 // Write a files artifact for an explicit level.
@@ -150,7 +158,7 @@ function writeRowListArtifact({ path, rows, kind, level, metaFirstRow, extraMeta
 
   const first = rows[0];
   const rest = rows.slice(1);
-  return writeJson(path, [{ _meta: true, level, kind, ts, ...(extraMeta || {}), ...first }, ...rest]);
+  return writeJson(path, [{ _meta: true, level, kind, ts, total_entries: rows.length, ...(extraMeta || {}), ...first }, ...rest]);
 }
 
 module.exports = {

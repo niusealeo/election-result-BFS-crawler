@@ -9,7 +9,7 @@ const { withLock } = require("../lib/lock");
 const { cfgForReq, domainCfg, ensureDomainFolders } = require("../lib/domain");
 const { stableUniqUrls, extFromUrl } = require("../lib/urlnorm");
 const { mergeFilesPreferSource } = require("../lib/dedupe");
-const { loadState, saveState, computeSeenUpTo } = require("../lib/state");
+const { loadState, saveState, computeSeenUpTo, reconcileStateFromArtifacts } = require("../lib/state");
 const { writeUrlArtifact, writeFileArtifact, writeUrlsForLevel, writeChunkedUrls } = require("../lib/artifacts");
 const { logEvent } = require("../lib/logger");
 const { listDomainKeys, listFileLevels, reconcileFilesLevel } = require("../lib/reconcile_files");
@@ -138,7 +138,9 @@ async function finalizeDiscoveryRun({ baseCfg, cfg, level, run_id, jsonlPath, re
   const inFiles = Array.from(acc.files.values());
   const filesMerged = mergeFilesPreferSource(inFiles);
 
-  const st = loadState(cfg.STATE_PATH);
+  // Self-aware state: reconcile from artifacts so we don't rely on a running total.
+  let st = loadState(cfg.STATE_PATH);
+  st = reconcileStateFromArtifacts(cfg, st, { maxLevel: level + 1 });
 
   // -------------------------------------------------------------------
   // IMPORTANT: Accumulate partial runs

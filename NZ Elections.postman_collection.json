@@ -440,8 +440,7 @@
               "\r",
               "\r",
               "// Set request URL from iteration data when running in Collection Runner\r",
-              "const rowUrl = pm.iterationData.get(\"url\") || pm.variables.get(\"url\");\r",
-              "if (rowUrl) { pm.request.url = rowUrl; }"
+              "const rowUrl = pm.iterationData.get(\"url\") || pm.variables.get(\"url\");\r"
             ],
             "type": "text/javascript",
             "packages": {},
@@ -683,8 +682,7 @@
               "\r",
               "\r",
               "// Set request URL from iteration data when running in Collection Runner\r",
-              "const rowUrl = pm.iterationData.get(\"url\") || pm.variables.get(\"url\");\r",
-              "if (rowUrl) { pm.request.url = rowUrl; }"
+              "const rowUrl = pm.iterationData.get(\"url\") || pm.variables.get(\"url\");\r"
             ],
             "type": "text/javascript",
             "packages": {},
